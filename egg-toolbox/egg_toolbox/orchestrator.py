@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator
 
 from .types import (
@@ -75,6 +75,18 @@ class Orchestrator:
     def __init__(self, backend: Backend):
         self._backend = backend
         self._tokenizer = backend.tokenizer()
+
+        # Dedicated single-thread executor for all backend generation
+        # calls.  Must be max_workers=1 so every request's producer
+        # runs on the *same* OS thread -- tinygrad caches its
+        # kernel-compile SQLite connection globally but sqlite3
+        # rejects cross-thread use ("SQLite objects created in a
+        # thread can only be used in that same thread").  Also:
+        # serialising requests is the right thing anyway because
+        # the underlying GPU is a single resource.
+        self._backend_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="egg-backend"
+        )
 
         # Load and analyze the chat template
         template_source = backend.chat_template_source()
@@ -192,8 +204,11 @@ class Orchestrator:
             finally:
                 _push(_SENTINEL)
 
-        thread = threading.Thread(target=producer, daemon=True, name="egg-toolbox-gen")
-        thread.start()
+        # Submit onto the orchestrator's dedicated single-thread
+        # executor so every request lands on the *same* OS thread
+        # (see note in __init__ re: tinygrad's thread-bound SQLite
+        # kernel cache).
+        self._backend_executor.submit(producer)
 
         token_count = 0
         max_tokens = request.sampling.max_tokens

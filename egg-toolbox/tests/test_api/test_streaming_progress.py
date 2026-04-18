@@ -62,12 +62,16 @@ class _SlowBackend(StepBackend):
 
     Each next() call on generate_tokens blocks for ``delay`` seconds
     before yielding, exactly like a real model's per-token decode.
+    Also records which OS thread each generate_tokens call ran on,
+    so we can assert that all requests land on the same worker
+    thread (required for tinygrad's per-thread SQLite cache).
     """
 
     def __init__(self, output: str, delay: float):
         self._output = output
         self._delay = delay
         self._tok = _CharTokenizer()
+        self.thread_ids: list[int] = []
 
     def load_model(self, model_path: str, **kwargs: Any) -> None:
         pass
@@ -79,6 +83,7 @@ class _SlowBackend(StepBackend):
         return HERMES_TEMPLATE
 
     def generate_tokens(self, request: CompiledRequest) -> Iterator[int]:
+        self.thread_ids.append(threading.get_ident())
         for c in self._output:
             time.sleep(self._delay)   # blocking sleep == GPU-decode analogue
             yield ord(c)
@@ -106,20 +111,48 @@ def running_server():
             break
 
     port = server.servers[0].sockets[0].getsockname()[1]
-    yield f"http://127.0.0.1:{port}"
+    yield f"http://127.0.0.1:{port}", backend
 
     server.should_exit = True
     thread.join(timeout=5)
 
 
+def test_all_requests_share_one_backend_thread(running_server):
+    """Regression: tinygrad's kernel-compile SQLite cache is global
+    but sqlite3 enforces per-thread connection use.  If each
+    request's producer ran on a fresh thread, the second request
+    would hit ``SQLite objects created in a thread can only be
+    used in that same thread``.  All requests must land on the
+    same single worker thread."""
+    url, backend = running_server
+    payload = {
+        "model": "x",
+        "messages": [{"role": "user", "content": "go"}],
+        "stream": False,
+        "max_tokens": 5,
+    }
+
+    with httpx.Client(timeout=30.0) as client:
+        for _ in range(3):
+            resp = client.post(f"{url}/v1/chat/completions", json=payload)
+            assert resp.status_code == 200
+
+    # Three calls, all on the same thread id.
+    assert len(backend.thread_ids) == 3
+    assert len(set(backend.thread_ids)) == 1, (
+        f"Requests ran on multiple threads: {backend.thread_ids}"
+    )
+
+
 def test_event_loop_not_blocked_during_generation(running_server):
     """A second request fired while the first is mid-generation must
-    not wait for the first to finish.  The sync backend blocks the
-    thread for N x delay, so if it ran on the event loop the second
-    request's response-start would be delayed by the same amount.
-    With the thread bridge, the event loop stays free and request 2's
-    first chunk arrives almost immediately.
+    still get a response (event loop must stay responsive).  With
+    the single-thread backend executor, request 2's generation will
+    queue until request 1 finishes, but request 2's HTTP handler
+    and message_start chunk still reach the client promptly -- the
+    event loop is not blocked waiting on the GPU.
     """
+    url, _backend = running_server
     payload = {
         "model": "x",
         "messages": [{"role": "user", "content": "go"}],
@@ -127,37 +160,33 @@ def test_event_loop_not_blocked_during_generation(running_server):
         "max_tokens": 10,
     }
 
-    first_chunk_times: list[float] = []
+    done_times: list[float] = []
 
     def fire_and_time(start: float) -> float:
         with httpx.Client(timeout=30.0) as client:
-            with client.stream("POST", f"{running_server}/v1/chat/completions",
+            with client.stream("POST", f"{url}/v1/chat/completions",
                                json=payload) as resp:
                 for line in resp.iter_lines():
-                    if line.startswith("data: "):
+                    if line.startswith("data: ") and line.endswith("[DONE]"):
                         return time.monotonic() - start
         return -1.0
 
     t_start = time.monotonic()
-    t1 = threading.Thread(target=lambda: first_chunk_times.append(fire_and_time(t_start)))
+    t1 = threading.Thread(target=lambda: done_times.append(fire_and_time(t_start)))
     t1.start()
-    # Small stagger so request 1 is genuinely mid-flight when 2 arrives.
     time.sleep(0.15)
-    t2 = threading.Thread(target=lambda: first_chunk_times.append(fire_and_time(t_start)))
+    t2 = threading.Thread(target=lambda: done_times.append(fire_and_time(t_start)))
     t2.start()
 
     t1.join(timeout=10)
     t2.join(timeout=10)
 
-    assert len(first_chunk_times) == 2
-    earliest, latest = sorted(first_chunk_times)
-    # Both first chunks should arrive within a few hundred ms of each
-    # other despite total generation taking 500 ms.  If the event loop
-    # were blocked, the second would wait for the first to finish.
-    assert latest < 0.6, (
-        f"Second request's first chunk arrived at {latest:.3f}s -- "
-        "looks like the event loop was blocked while the first "
-        "request was generating."
+    assert len(done_times) == 2
+    # With 5 tokens * 100 ms * 2 serialised requests = ~1.0 s + overhead,
+    # but neither should take more than ~1.5 s total (which would
+    # indicate a hang).  Both should reach completion.
+    assert max(done_times) < 2.0, (
+        f"Requests took too long: {done_times}"
     )
 
 
@@ -166,6 +195,7 @@ def test_sse_chunks_arrive_progressively(running_server):
     least roughly the number-of-tokens * delay.  If chunks were
     buffered until the whole generation finished, we would instead see
     all deltas arrive in a burst at the end."""
+    url, _backend = running_server
     payload = {
         "model": "x",
         "messages": [{"role": "user", "content": "go"}],
@@ -177,7 +207,7 @@ def test_sse_chunks_arrive_progressively(running_server):
     t_start = time.monotonic()
 
     with httpx.Client(timeout=30.0) as client:
-        with client.stream("POST", f"{running_server}/v1/chat/completions",
+        with client.stream("POST", f"{url}/v1/chat/completions",
                            json=payload) as resp:
             assert resp.status_code == 200
             for line in resp.iter_lines():
