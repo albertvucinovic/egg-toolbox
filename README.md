@@ -58,6 +58,118 @@ The server listens on `http://127.0.0.1:8000` and exposes:
 | `/v1/models` | GET | List the loaded model |
 | `/health` | GET | Health check |
 
+## Recipe: Qwen3-8B on tinygrad
+
+A concrete end-to-end walkthrough, tested on an RTX 4090 (24 GB).  Qwen3-8B uses the Hermes tool-call format (`<tool_call>`), which egg-toolbox handles out of the box.
+
+### 1. Prerequisites
+
+- NVIDIA GPU with ≥20 GB VRAM (RTX 3090 / 4090 / A5000 class)
+- CUDA installed and visible to tinygrad
+- egg-toolbox installed per the Quick start above
+
+### 2. Pick a quantization
+
+tinygrad's GGUF loader accepts `Q4_0`, `Q4_1`, `Q8_0`, `Q4_K`, `Q6_K`, `F16`, and `MXFP4`.  It does *not* accept `Q5_0`, `Q5_1`, `Q2_K`, `Q3_K`, or `Q5_K` — and some `Q4_K_M` GGUFs mix in those types for accuracy, which will fail to load with `ValueError: GGML type 'N' is not supported!`.  The safe options:
+
+| Quant | File size | Quality |
+|---|---|---|
+| `Q4_0` | ~4.5 GB | Good, guaranteed to load |
+| `Q4_K_S` | ~4.8 GB | Pure Q4_K, usually loads |
+| `Q8_0` | ~8.7 GB | High quality |
+
+### 3. Download
+
+```bash
+mkdir -p models
+cd models
+# Q4_0 — smallest that's guaranteed to load:
+wget https://huggingface.co/bartowski/Qwen_Qwen3-8B-GGUF/resolve/main/Qwen_Qwen3-8B-Q4_0.gguf
+cd ..
+```
+
+Verify the exact filename on the repo page; bartowski's naming can vary slightly.
+
+### 4. Run the server
+
+```bash
+python -m egg_toolbox models/Qwen_Qwen3-8B-Q4_0.gguf \
+  --backend tinygrad \
+  --host 127.0.0.1 --port 8765 \
+  --context-length 8192
+```
+
+`--context-length 8192` is important.  Qwen3-8B's native context is 131 072 tokens and tinygrad preallocates the full KV cache at first forward pass — without this flag the KV cache alone would OOM a 24 GB card.  8192 tokens is plenty for tool-call testing; scale up if you need more.
+
+Expect ~20 GB of VRAM usage after the first request lands (weights dequantized to fp16 by tinygrad, plus KV cache and activations).  First request takes longer because tinygrad compiles kernels; subsequent requests are fast and cached.
+
+### 5. Smoke-test
+
+In another terminal:
+
+```bash
+curl -s http://127.0.0.1:8765/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen",
+    "messages": [{"role": "user", "content": "Reply in one short sentence: what is 2+2?"}],
+    "max_tokens": 40,
+    "stream": false
+  }' | python3 -m json.tool
+```
+
+### 6. Tool call
+
+Qwen3-8B natively emits `<tool_call>`; egg-toolbox's Hermes handler projects that to OpenAI-compat `tool_calls`:
+
+```bash
+curl -s http://127.0.0.1:8765/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen",
+    "messages": [{"role": "user", "content": "What is the weather in Zagreb?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }],
+    "max_tokens": 80,
+    "stream": false
+  }' | python3 -m json.tool
+```
+
+You should get back `"tool_calls": [{"function": {"name": "get_weather", "arguments": "{\"city\": \"Zagreb\"}"}, ...}]` and `"finish_reason": "tool_calls"`.
+
+### 7. Streaming
+
+Add `"stream": true`:
+
+```bash
+curl -sN http://127.0.0.1:8765/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Say hi."}],"max_tokens":20,"stream":true}'
+```
+
+You'll see OpenAI-compat SSE chunks followed by `data: [DONE]`.
+
+### 8. If it doesn't fit
+
+Drop to a smaller model — Qwen3-4B in fp16 is ~8 GB of weights, Qwen3-1.7B is ~3.4 GB.  Both run the same tool-call path.  Add more context if you need: e.g. `--context-length 32768` still fits comfortably for 4B on a 24 GB card.
+
+### 9. Troubleshooting
+
+- **`CUDA_ERROR_OUT_OF_MEMORY`**: drop `--context-length`, use a smaller model, or close other GPU users.  Check `nvidia-smi` for leftover processes.
+- **`GGML type 'N' is not supported!`**: the GGUF contains an unsupported quant (typically Q5_0 inside a Q4_K_M mix).  Download a `Q4_0` or `Q4_K_S` variant instead.
+- **Gibberish output**: unusual — open a bug with the model path.  We had one like this for Qwen2 attention biases; the tinygrad backend now patches that automatically.
+- **First request very slow**: expected; tinygrad compiles CUDA kernels on demand.  Results are cached under `~/.cache/tinygrad`, so subsequent runs start faster.
+
 ## Example — tool call via `curl`
 
 ```bash
