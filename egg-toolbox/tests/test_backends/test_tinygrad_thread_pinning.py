@@ -50,8 +50,9 @@ def test_load_and_generate_run_on_same_thread(monkeypatch):
             def __call__(self, t, start_pos):
                 thread_ids.append(("generate", threading.get_ident()))
                 class _R:
-                    def item(self_inner):
-                        return 1
+                    def tolist(self_inner):
+                        # One-hot logits -> argmax picks token 1.
+                        return [[0.0, 1.0]]
                 return _R()
         return FakeModel(), FakeKV()
 
@@ -76,6 +77,11 @@ def test_load_and_generate_run_on_same_thread(monkeypatch):
     fake_tinygrad.Tensor = _FakeTensor
     fake_tinygrad.UOp = _FakeUOp
     fake_tinygrad.getenv = lambda name, default=1: default
+    class _FakeTinyJit:
+        def __init__(self, fn): self.fn = fn
+        def reset(self): pass
+        def __call__(self, *a, **k): return self.fn(*a, **k)
+    fake_tinygrad.TinyJit = _FakeTinyJit
     monkeypatch.setitem(sys.modules, "tinygrad", fake_tinygrad)
 
     fake_apps_llm = types.ModuleType("tinygrad.apps.llm")
@@ -175,8 +181,11 @@ def test_generate_tokens_stops_backend_when_caller_stops_iterating(monkeypatch):
                 _t.sleep(0.005)   # 5 ms per forward
                 val = self._counter[0]
                 class _R:
-                    def item(self_inner):
-                        return val
+                    def tolist(self_inner):
+                        # Dense one-hot logits: argmax picks `val`.
+                        row = [0.0] * max(val + 1, 8)
+                        row[val] = 1.0
+                        return [row]
                 return _R()
         return FakeModel(), FakeKV()
 
@@ -196,6 +205,11 @@ def test_generate_tokens_stops_backend_when_caller_stops_iterating(monkeypatch):
     fake_tg.Tensor = _FakeTensor
     fake_tg.UOp = _FakeUOp
     fake_tg.getenv = lambda name, default=1: default
+    class _FakeTinyJit:
+        def __init__(self, fn): self.fn = fn
+        def reset(self): pass
+        def __call__(self, *a, **k): return self.fn(*a, **k)
+    fake_tg.TinyJit = _FakeTinyJit
     monkeypatch.setitem(sys.modules, "tinygrad", fake_tg)
 
     fake_llm = types.ModuleType("tinygrad.apps.llm")
@@ -278,8 +292,8 @@ def test_multiple_generate_calls_share_backend_thread(monkeypatch):
             def __call__(self, t, start_pos):
                 generate_thread_ids.append(threading.get_ident())
                 class _R:
-                    def item(self_inner):
-                        return 1
+                    def tolist(self_inner):
+                        return [[0.0, 1.0]]
                 return _R()
         return FakeModel(), FakeKV()
 
@@ -299,6 +313,11 @@ def test_multiple_generate_calls_share_backend_thread(monkeypatch):
     fake_tinygrad.Tensor = _FakeTensor
     fake_tinygrad.UOp = _FakeUOp
     fake_tinygrad.getenv = lambda name, default=1: default
+    class _FakeTinyJit:
+        def __init__(self, fn): self.fn = fn
+        def reset(self): pass
+        def __call__(self, *a, **k): return self.fn(*a, **k)
+    fake_tinygrad.TinyJit = _FakeTinyJit
     monkeypatch.setitem(sys.modules, "tinygrad", fake_tinygrad)
 
     fake_apps_llm = types.ModuleType("tinygrad.apps.llm")

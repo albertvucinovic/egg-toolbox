@@ -102,7 +102,7 @@ class TinygradBackend(StepBackend):
         self._executor.submit(self._do_load_model, model_path, **kwargs).result()
 
     def _do_load_model(self, model_path: str, **kwargs: Any) -> None:
-        from tinygrad import Tensor
+        from tinygrad import Tensor, TinyJit
         from tinygrad.apps.llm import SimpleTokenizer
 
         model_path_obj = Path(model_path)
@@ -113,6 +113,26 @@ class TinygradBackend(StepBackend):
         # because tinygrad's default ignores attn_{q,k,v}.bias tensors,
         # which Qwen2/Qwen2.5 and other archs require for correct output.
         self._model, kv = _from_gguf_with_qkv_bias(Tensor(model_path_obj), **kwargs)
+
+        # Replace the model's forward with a logits-returning variant.
+        # tinygrad's upstream ``Transformer.forward`` folds the sampler
+        # tail (softmax + argmax) into the traced graph, so every call
+        # returns a single token id and temperature/top_p/top_k are
+        # silently ignored.  We re-express the forward to return the
+        # raw logits for the last token (shape (1, vocab_size)) and
+        # do sampling in Python via egg_toolbox.sampling.  The JIT is
+        # rebuilt against the new function so the decode-path kernel
+        # recompiles once at load time.
+        model = self._model
+
+        def _forward_logits(tokens: Any, start_pos: Any) -> Any:
+            x = model.token_embd(tokens)
+            for block in model.blk:
+                x = block(x, start_pos)
+            return model.output(model.output_norm(x))[:, -1, :]
+
+        model.forward = _forward_logits
+        model.forward_jit = TinyJit(_forward_logits)
 
         # Extract chat template from GGUF metadata
         from ..template import ChatTemplate
@@ -230,13 +250,21 @@ class TinygradBackend(StepBackend):
         preserved across cancel and across the producer's normal
         exit.  On exception the outer ``_run`` clears it.
         """
+        import numpy as np
         from tinygrad import Tensor, UOp, getenv
+
+        from ..sampling import sample_next_token, _rng_for
 
         model = self._model
         assert model is not None
 
         prompt_list = list(request.prompt_tokens)
         assert prompt_list, "empty prompt_tokens"
+
+        # Per-request rng so concurrent requests (serialised on the
+        # backend thread, but still semantically per-request) do not
+        # share entropy.  Built once, reused for every decode step.
+        rng = _rng_for(request.sampling.seed)
 
         enable_cache = os.environ.get("EGG_PREFIX_CACHE", "1") != "0"
 
@@ -263,11 +291,18 @@ class TinygradBackend(StepBackend):
 
         # --- Prefill the diverging suffix. --------------------------
         # T > 1 -> non-JIT forward path (matches upstream generate).
+        # The forward has been patched (see _do_load_model) to return
+        # logits shape (1, vocab_size) instead of argmax; we sample in
+        # Python via egg_toolbox.sampling.
         t = Tensor([new_suffix], dtype="int32")
-        t = model(t, cp)
+        logits = model(t, cp)
         # cache_kv[0:len(prompt_list)) now reflects prompt_list exactly.
         self._cache_tokens = list(prompt_list)
-        next_id = int(t.item())
+        next_id = sample_next_token(
+            np.asarray(logits.tolist()[0], dtype=np.float32),
+            request.sampling,
+            rng,
+        )
         yield next_id
 
         # --- Decode loop. -------------------------------------------
@@ -283,14 +318,18 @@ class TinygradBackend(StepBackend):
                 break
             t = Tensor([[next_id]], dtype="int32")
             sp = v_start_pos.bind(pos) if use_sym else pos
-            t = model(t, sp)
+            logits = model(t, sp)
             # We've just fed `next_id` at cache position `pos`.  The
             # assign in _attention writes cache_kv[pos:pos+1), and the
             # resident-tokens list must grow in lockstep so that if a
             # cancel arrives right now, the invariant still holds.
             self._cache_tokens.append(next_id)
             pos += 1
-            next_id = int(t.item())
+            next_id = sample_next_token(
+                np.asarray(logits.tolist()[0], dtype=np.float32),
+                request.sampling,
+                rng,
+            )
             yield next_id
 
     def model_name(self) -> str:

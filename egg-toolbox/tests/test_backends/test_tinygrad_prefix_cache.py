@@ -56,8 +56,11 @@ class _FakeModel:
         self._idx += 1
 
         class _Result:
-            def item(self_inner):  # noqa: ARG002
-                return next_id
+            def tolist(self_inner):  # noqa: ARG002
+                # One-hot logits so argmax picks next_id.
+                row = [0.0] * max(next_id + 1, 8)
+                row[next_id] = 1.0
+                return [row]
 
         return _Result()
 
@@ -96,6 +99,11 @@ def _install_tinygrad_stub(monkeypatch):
     fake_tg.UOp = _FakeUOp
     fake_tg.getenv = lambda name, default=1: default
     fake_tg.nn = types.SimpleNamespace()  # for any stray access
+    class _FakeTinyJit:
+        def __init__(self, fn): self.fn = fn
+        def reset(self): pass
+        def __call__(self, *a, **k): return self.fn(*a, **k)
+    fake_tg.TinyJit = _FakeTinyJit
     monkeypatch.setitem(sys.modules, "tinygrad", fake_tg)
 
     fake_apps_llm = types.ModuleType("tinygrad.apps.llm")
@@ -300,8 +308,10 @@ def test_mid_forward_exception_invalidates_cache(monkeypatch):
                                start_pos if isinstance(start_pos, int)
                                else getattr(start_pos, "_bound_value", -1)))
             class _R:
-                def item(self_inner):  # noqa: ARG002
-                    return 7
+                def tolist(self_inner):  # noqa: ARG002
+                    row = [0.0] * 8
+                    row[7] = 1.0
+                    return [row]
             return _R()
 
     shim = _ShimModel()
