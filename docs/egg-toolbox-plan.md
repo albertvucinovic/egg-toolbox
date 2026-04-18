@@ -1,4 +1,4 @@
-# Plan: `omnitool` -- Universal Tool Calling Middleware for Local LLMs
+# Plan: `egg-toolbox` -- Universal Tool Calling Middleware for Local LLMs
 
 ## Context
 
@@ -80,9 +80,9 @@ class EventKind(enum.Enum):
 ## Directory Layout
 
 ```
-omnitool/
+egg_toolbox/
   pyproject.toml
-  omnitool/
+  egg_toolbox/
     __init__.py
     __main__.py           # CLI entry point (argparse)
     types.py              # Frozen dataclasses: Tool, ChatMessage, SemanticEvent, SamplingParams, CompiledRequest
@@ -141,11 +141,11 @@ omnitool/
 8. **`orchestrator.py`** -- Request lifecycle: render template -> tokenize -> create compiled request -> generate tokens -> feed parser -> yield events. Step-backend flow with stop string partial matching (StopStringMatcher)
 9. **`api/openai.py`** -- `/v1/chat/completions`: parse OpenAI request -> call orchestrator -> project SemanticEvents to OpenAI SSE chunks. Handles streaming + non-streaming
 10. **`api/middleware.py`** -- Starlette app factory with CORS, `/v1/models`, `/health`
-11. **`__main__.py`** -- argparse CLI: `omnitool model.gguf --backend tinygrad --port 8000`
+11. **`__main__.py`** -- argparse CLI: `egg-toolbox model.gguf --backend tinygrad --port 8000`
 12. **`detector.py`** -- Stub: keyword match on template source (return HERMES if `<tool_call>` found)
 13. **Tests** -- Template rendering, Hermes parser with recorded token sequences, OpenAI SSE format correctness
 
-**Validation**: `omnitool qwen3-8b.gguf --backend tinygrad`, then use OpenAI Python client to send a tool-calling request and receive streaming tool calls.
+**Validation**: `egg-toolbox qwen3-8b.gguf --backend tinygrad`, then use OpenAI Python client to send a tool-calling request and receive streaming tool calls.
 
 ### Phase 2: Format Coverage + Anthropic API
 

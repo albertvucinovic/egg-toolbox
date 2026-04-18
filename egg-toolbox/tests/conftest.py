@@ -14,10 +14,10 @@ from typing import Any, Iterator
 import pytest
 from starlette.testclient import TestClient
 
-from omnitool.types import CompiledRequest
-from omnitool.backends.base import StepBackend, Tokenizer
-from omnitool.orchestrator import Orchestrator
-from omnitool.api.middleware import create_app
+from egg_toolbox.types import CompiledRequest
+from egg_toolbox.backends.base import StepBackend, Tokenizer
+from egg_toolbox.orchestrator import Orchestrator
+from egg_toolbox.api.middleware import create_app
 
 
 # ---------------------------------------------------------------------------

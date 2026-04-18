@@ -3,7 +3,7 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser(
-        description="omnitool: Universal tool calling middleware for local LLMs"
+        description="egg-toolbox: Universal tool calling middleware for local LLMs"
     )
     parser.add_argument("model", help="Path to model (GGUF file or HF model ID)")
     parser.add_argument("--backend", choices=["tinygrad", "vllm", "sglang", "llamacpp"],

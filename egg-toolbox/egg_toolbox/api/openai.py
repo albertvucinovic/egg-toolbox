@@ -84,7 +84,7 @@ async def _stream_response(
             "object": "chat.completion.chunk",
             "created": created,
             "model": model_name,
-            "system_fingerprint": "omnitool-v0",
+            "system_fingerprint": "egg-toolbox-v0",
             "choices": [],
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -153,7 +153,7 @@ async def _non_stream_response(
         "object": "chat.completion",
         "created": created,
         "model": model_name,
-        "system_fingerprint": "omnitool-v0",
+        "system_fingerprint": "egg-toolbox-v0",
         "choices": [{
             "index": 0,
             "message": message,
@@ -238,7 +238,7 @@ def _make_chunk(
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "system_fingerprint": "omnitool-v0",
+        "system_fingerprint": "egg-toolbox-v0",
         "choices": [{
             "index": 0,
             "delta": delta,

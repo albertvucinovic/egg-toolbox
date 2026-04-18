@@ -1,9 +1,53 @@
 import enum
 import json
+import re
 from typing import Any
 
 from ..types import SemanticEvent, EventKind, StopReason, Tool, FormatAnalysis
 from .base import FormatHandler, FormatParserState
+
+
+_NAME_FALLBACK = re.compile(r'"name"\s*:\s*"([^"]+)"')
+_ARGS_FALLBACK = re.compile(r'"arguments"\s*:\s*(\{.*\}|\[.*\]|"[^"]*"|[^,}\s]+)', re.DOTALL)
+
+
+def _parse_tool_call_body(body: str, name_field: str, args_field: str) -> tuple[str, str]:
+    """Extract (name, arguments_string) from a <tool_call> body.
+
+    Attempts strict json.loads first, then tolerant repair
+    (strip leading/trailing noise, collapse doubled braces, strip
+    trailing commas), then regex fallback.  Returns empty strings
+    if nothing usable can be extracted.
+    """
+    candidates = [body, body.strip()]
+    stripped = body.strip()
+    # Collapse a doubled leading brace ("{{" -> "{") which real-world
+    # models occasionally emit as a single BPE token.
+    if stripped.startswith("{{") and stripped.endswith("}}"):
+        candidates.append("{" + stripped[2:-2] + "}")
+    elif stripped.startswith("{{"):
+        candidates.append("{" + stripped[2:])
+    # Strip trailing commas before } or ]
+    candidates.append(re.sub(r",(\s*[}\]])", r"\1", stripped))
+
+    for cand in candidates:
+        try:
+            parsed = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        name = parsed.get(name_field, parsed.get("name", "")) or ""
+        raw = parsed.get(args_field, parsed.get("arguments", {}))
+        args = json.dumps(raw) if not isinstance(raw, str) else raw
+        return str(name), args
+
+    # Regex fallback for unparseable bodies.
+    name_match = _NAME_FALLBACK.search(body)
+    args_match = _ARGS_FALLBACK.search(body)
+    name = name_match.group(1) if name_match else ""
+    args = args_match.group(1) if args_match else body.strip()
+    return name, args
 
 
 class HermesHandler(FormatHandler):
@@ -116,54 +160,63 @@ class HermesParserState(FormatParserState):
         return events
 
     def _process_in_tool(self) -> list[SemanticEvent]:
-        """In IN_TOOL_TAG state: accumulate JSON, emit args deltas, watch for </tool_call>."""
+        """In IN_TOOL_TAG state: accumulate JSON until </tool_call>.
+
+        We do not stream TOOL_ARGS_DELTA from raw token chunks -- the
+        <tool_call> body contains both ``name`` and ``arguments`` fields
+        (plus structural JSON noise), so streaming raw chunks would
+        pollute the arguments projection.  Instead we buffer the full
+        body and emit NAME + ARGS_DELTA(complete_args) + COMMIT once
+        the tool call is closed.
+        """
         events: list[SemanticEvent] = []
         if self._tag_end in self._buffer:
             idx = self._buffer.index(self._tag_end)
-            json_chunk = self._buffer[:idx]
-            self._json_buffer += json_chunk
+            self._json_buffer += self._buffer[:idx]
             self._buffer = self._buffer[idx + len(self._tag_end):]
+            events.extend(self._commit_buffered_tool_call())
+            self._state = _HermesState.AFTER_TOOL_CALL
+            return events
 
-            # Parse the complete JSON
-            try:
-                parsed = json.loads(self._json_buffer)
-                name = parsed.get(self._analysis.name_field, parsed.get("name", ""))
-                args_raw = parsed.get(self._analysis.args_field, parsed.get("arguments", {}))
-                args = json.dumps(args_raw) if not isinstance(args_raw, str) else args_raw
-            except json.JSONDecodeError:
-                name = ""
-                args = self._json_buffer
+        # Look for a partial end tag suffix so we don't eat into "</"
+        for i in range(1, len(self._tag_end)):
+            if self._buffer.endswith(self._tag_end[:i]):
+                self._json_buffer += self._buffer[:-i]
+                self._buffer = self._buffer[-i:]
+                return events
 
-            events.append(SemanticEvent(kind=EventKind.TOOL_CALL_NAME, tool_index=self._tool_index, tool_name=name))
-            events.append(SemanticEvent(kind=EventKind.TOOL_ARGS_DELTA, tool_index=self._tool_index, text=args))
-            events.append(SemanticEvent(
+        # No partial match -- absorb the whole buffer into json_buffer.
+        self._json_buffer += self._buffer
+        self._buffer = ""
+        return events
+
+    def _commit_buffered_tool_call(self) -> list[SemanticEvent]:
+        """Parse self._json_buffer and emit NAME + ARGS_DELTA + COMMIT.
+
+        Always advances _tool_index so the caller can return
+        StopReason.TOOL_CALLS even if the body was malformed -- the
+        model clearly *intended* a tool call by opening <tool_call>.
+        """
+        name, args = _parse_tool_call_body(
+            self._json_buffer,
+            self._analysis.name_field,
+            self._analysis.args_field,
+        )
+        self._json_buffer = ""
+        tool_call_id = f"call_{self._tool_index}"
+        events = [
+            SemanticEvent(kind=EventKind.TOOL_CALL_NAME, tool_index=self._tool_index, tool_name=name),
+            SemanticEvent(kind=EventKind.TOOL_ARGS_DELTA, tool_index=self._tool_index, text=args),
+            SemanticEvent(
                 kind=EventKind.TOOL_CALL_COMMIT,
                 tool_index=self._tool_index,
-                tool_call_id=f"call_{self._tool_index}",
+                tool_call_id=tool_call_id,
                 tool_name=name,
                 tool_arguments=args,
-            ))
-            self._committed_tools.append({"name": name, "arguments": args})
-            self._tool_index += 1
-            self._state = _HermesState.AFTER_TOOL_CALL
-        else:
-            # Check for partial end tag
-            has_partial = False
-            for i in range(1, len(self._tag_end)):
-                if self._buffer.endswith(self._tag_end[:i]):
-                    # Stream the safe part as args delta
-                    safe = self._buffer[:-i]
-                    if safe:
-                        self._json_buffer += safe
-                        events.append(SemanticEvent(kind=EventKind.TOOL_ARGS_DELTA, tool_index=self._tool_index, text=safe))
-                    self._buffer = self._buffer[-i:]
-                    has_partial = True
-                    break
-            if not has_partial:
-                # Stream args deltas as they arrive
-                self._json_buffer += self._buffer
-                events.append(SemanticEvent(kind=EventKind.TOOL_ARGS_DELTA, tool_index=self._tool_index, text=self._buffer))
-                self._buffer = ""
+            ),
+        ]
+        self._committed_tools.append({"name": name, "arguments": args})
+        self._tool_index += 1
         return events
 
     def _process_reasoning(self) -> list[SemanticEvent]:
@@ -255,27 +308,14 @@ class HermesParserState(FormatParserState):
     def finish(self) -> list[SemanticEvent]:
         events: list[SemanticEvent] = []
 
-        # Commit any in-progress tool call (buffer may be empty if the
-        # orchestrator's stop-string matcher already consumed </tool_call>).
+        # Commit any in-progress tool call.  The orchestrator's
+        # stop-string matcher typically consumes </tool_call> before it
+        # ever reaches us, so reaching finish() in IN_TOOL_TAG is the
+        # normal path for the real backend (not an error).
         if self._state == _HermesState.IN_TOOL_TAG:
             self._json_buffer += self._buffer
             self._buffer = ""
-            try:
-                parsed = json.loads(self._json_buffer)
-                name = parsed.get(self._analysis.name_field, parsed.get("name", ""))
-                args_raw = parsed.get(self._analysis.args_field, parsed.get("arguments", {}))
-                args = json.dumps(args_raw) if not isinstance(args_raw, str) else args_raw
-                events.append(SemanticEvent(kind=EventKind.TOOL_CALL_NAME, tool_index=self._tool_index, tool_name=name))
-                events.append(SemanticEvent(
-                    kind=EventKind.TOOL_CALL_COMMIT,
-                    tool_index=self._tool_index,
-                    tool_call_id=f"call_{self._tool_index}",
-                    tool_name=name,
-                    tool_arguments=args,
-                ))
-                self._tool_index += 1
-            except json.JSONDecodeError:
-                pass
+            events.extend(self._commit_buffered_tool_call())
         elif self._buffer:
             if self._state in (_HermesState.CONTENT, _HermesState.AFTER_TOOL_CALL):
                 if self._buffer.strip():

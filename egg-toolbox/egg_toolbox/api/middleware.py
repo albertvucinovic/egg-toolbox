@@ -78,7 +78,7 @@ def create_app(orchestrator: Orchestrator) -> Starlette:
                 "id": model_name,
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": "omnitool",
+                "owned_by": "egg-toolbox",
             }],
         })
 

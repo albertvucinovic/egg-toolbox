@@ -1,8 +1,8 @@
-# Architecture: `omnitool` -- Universal Tool Calling Middleware for Local LLMs
+# Architecture: `egg-toolbox` -- Universal Tool Calling Middleware for Local LLMs
 
 ## 1. Project Identity
 
-**Name**: `omnitool`
+**Name**: `egg-toolbox`
 **Repository**: Standalone (not part of egg-mono)
 **Language**: Pure Python (no Rust, no C extensions)
 **License**: MIT
@@ -74,10 +74,10 @@
 ## 3. Directory Layout
 
 ```
-omnitool/
+egg_toolbox/
   pyproject.toml
   README.md
-  omnitool/
+  egg_toolbox/
     __init__.py
     __main__.py              # CLI entry point (argparse)
     types.py                 # Core data types (frozen dataclasses)
@@ -135,7 +135,7 @@ omnitool/
 
 ---
 
-## 4. Core Types (`omnitool/types.py`)
+## 4. Core Types (`egg_toolbox/types.py`)
 
 All types are frozen dataclasses or enums. No mutability in the data layer.
 
@@ -316,7 +316,7 @@ class FormatAnalysis:
 
 ---
 
-## 5. Chat Template Engine (`omnitool/template.py`)
+## 5. Chat Template Engine (`egg_toolbox/template.py`)
 
 The template engine loads Jinja2 chat templates from three sources:
 1. GGUF file metadata (`tokenizer.chat_template`)
@@ -443,7 +443,7 @@ Implementation approach: Parse the GGUF key-value metadata section only (no need
 
 ---
 
-## 6. Format Detector (`omnitool/detector.py`)
+## 6. Format Detector (`egg_toolbox/detector.py`)
 
 This is the Python port of llama.cpp's autoparser. It uses differential template analysis.
 
@@ -575,7 +575,7 @@ def detect_format(template: ChatTemplate) -> FormatAnalysis:
 
 ---
 
-## 7. Format Handlers (`omnitool/formats/base.py`)
+## 7. Format Handlers (`egg_toolbox/formats/base.py`)
 
 Each format handler knows how to:
 1. Provide stop strings and stop token IDs for its format
@@ -681,7 +681,7 @@ class FormatParserState(abc.ABC):
         ...
 ```
 
-### Concrete Format Handler: Hermes (`omnitool/formats/hermes.py`)
+### Concrete Format Handler: Hermes (`egg_toolbox/formats/hermes.py`)
 
 The Hermes format is the most common (used by Qwen, Hermes, many fine-tunes).
 
@@ -896,7 +896,7 @@ Each implements:
 | `HarmonyHandler` | `<\|channel\|>` markers | Multi-channel state machine | 3 channels: analysis→reasoning, commentary→tool calls, final→content. TypeScript namespace tool defs |
 | `GenericHandler` | Raw `{` or `[` | Incremental JSON bracket matching | Fallback; no structural markers |
 
-### Concrete Format Handler: Harmony (`omnitool/formats/harmony.py`)
+### Concrete Format Handler: Harmony (`egg_toolbox/formats/harmony.py`)
 
 Harmony uses a multi-channel architecture where the model writes to 3 named channels:
 - **analysis**: Internal reasoning (maps to `REASONING_DELTA`)
@@ -1110,7 +1110,7 @@ def _ts_type(json_type: str) -> str:
 
 ---
 
-## 8. Streaming Parser (`omnitool/parser.py`)
+## 8. Streaming Parser (`egg_toolbox/parser.py`)
 
 The parser wraps a `FormatParserState` and adds:
 1. Reasoning prefix handling (generation prompt stripping)
@@ -1217,7 +1217,7 @@ class StreamingParser:
 
 ---
 
-## 9. Backend Abstraction (`omnitool/backends/base.py`)
+## 9. Backend Abstraction (`egg_toolbox/backends/base.py`)
 
 Two abstract base classes reflecting the two backend modes.
 
@@ -1325,7 +1325,7 @@ class ConstraintBackend(abc.ABC):
 Backend = StepBackend | ConstraintBackend
 ```
 
-### tinygrad backend (`omnitool/backends/tinygrad.py`)
+### tinygrad backend (`egg_toolbox/backends/tinygrad.py`)
 
 ```python
 from __future__ import annotations
@@ -1408,7 +1408,7 @@ class TinygradBackend(StepBackend):
         return self._model_name
 ```
 
-### vLLM backend (`omnitool/backends/vllm.py`)
+### vLLM backend (`egg_toolbox/backends/vllm.py`)
 
 ```python
 class VLLMBackend(ConstraintBackend):
@@ -1454,7 +1454,7 @@ class VLLMBackend(ConstraintBackend):
 
 ---
 
-## 10. Orchestrator (`omnitool/orchestrator.py`)
+## 10. Orchestrator (`egg_toolbox/orchestrator.py`)
 
 The orchestrator is the central coordinator. It owns the request lifecycle:
 `receive request -> compile prompt -> generate -> parse -> emit events`
@@ -1630,9 +1630,9 @@ class Orchestrator:
 
 ---
 
-## 11. API Layer (`omnitool/api/`)
+## 11. API Layer (`egg_toolbox/api/`)
 
-### OpenAI-Compatible API (`omnitool/api/openai.py`)
+### OpenAI-Compatible API (`egg_toolbox/api/openai.py`)
 
 Projects `SemanticEvent` stream into OpenAI `/v1/chat/completions` SSE format.
 
@@ -1788,7 +1788,7 @@ def _parse_tools(raw: list[dict]) -> list[Tool]: ...
 def _parse_sampling(body: dict) -> SamplingParams: ...
 ```
 
-### Anthropic-Compatible API (`omnitool/api/anthropic.py`)
+### Anthropic-Compatible API (`egg_toolbox/api/anthropic.py`)
 
 Projects the same `SemanticEvent` stream into Anthropic `/v1/messages` SSE format.
 
@@ -1878,7 +1878,7 @@ def _event_to_anthropic_events(
     return sse_events
 ```
 
-### ASGI Application (`omnitool/api/middleware.py`)
+### ASGI Application (`egg_toolbox/api/middleware.py`)
 
 ```python
 from starlette.applications import Starlette
@@ -1907,7 +1907,7 @@ def create_app(orchestrator) -> Starlette:
 
 ---
 
-## 12. Grammar Generation (`omnitool/grammar.py`)
+## 12. Grammar Generation (`egg_toolbox/grammar.py`)
 
 Generates GBNF grammars from tool definitions. Used by step backends (tinygrad, llama-cpp-python) to constrain output to valid tool calls.
 
@@ -1999,7 +1999,7 @@ def _json_primitives_gbnf() -> list[str]:
 
 ---
 
-## 13. CLI Entry Point (`omnitool/__main__.py`)
+## 13. CLI Entry Point (`egg_toolbox/__main__.py`)
 
 ```python
 import argparse
@@ -2008,7 +2008,7 @@ import uvicorn
 
 def main():
     parser = argparse.ArgumentParser(
-        description="omnitool: Universal tool calling middleware for local LLMs"
+        description="egg-toolbox: Universal tool calling middleware for local LLMs"
     )
     parser.add_argument("model", help="Path to model (GGUF file or HF model ID)")
     parser.add_argument("--backend", choices=["tinygrad", "vllm", "sglang", "llamacpp"],
@@ -2233,13 +2233,13 @@ Step 4: Assemble FormatAnalysis from all extracted markers
 
 ### 14.5 Speculative Decoding with Grammar Constraints
 
-Speculative decoding uses a small "draft" model to propose multiple tokens at once, then verifies them against the target model in a single forward pass. This interacts with omnitool at two levels:
+Speculative decoding uses a small "draft" model to propose multiple tokens at once, then verifies them against the target model in a single forward pass. This interacts with egg-toolbox at two levels:
 
 #### Level 1: Backend-transparent (Phase 3)
 
-Speculative decoding that happens entirely within the backend is invisible to omnitool. The backend's `generate_tokens()` still yields verified tokens one at a time via `Iterator[int]`. This works automatically with:
+Speculative decoding that happens entirely within the backend is invisible to egg_toolbox. The backend's `generate_tokens()` still yields verified tokens one at a time via `Iterator[int]`. This works automatically with:
 
-| Backend | How to enable | omnitool changes |
+| Backend | How to enable | egg-toolbox changes |
 |---|---|---|
 | llama-cpp-python | `n_draft=N` parameter + draft model | None -- verified tokens come through same interface |
 | vLLM | `--speculative-model` flag | None -- text chunks arrive via same `AsyncIterator[str]` |
@@ -2399,7 +2399,7 @@ Parse recorded outputs from each format correctly.
 | P1 | `backends/sglang.py` | Engine integration with Xgrammar |
 | P0 | `grammar.py` | Full JSON-schema-to-GBNF for all formats |
 | P1 | Lazy grammar | For llama-cpp-python backend |
-| P1 | Speculative decoding | Backend-transparent: enable via backend config (`n_draft`, `--speculative-model`). No omnitool changes needed -- verified tokens flow through same interfaces |
+| P1 | Speculative decoding | Backend-transparent: enable via backend config (`n_draft`, `--speculative-model`). No egg-toolbox changes needed -- verified tokens flow through same interfaces |
 | P1 | Tests | Integration tests per backend |
 
 **Validation**: Same test suite passes on all 4 backends.
@@ -2486,7 +2486,7 @@ Speculative decoding (where backend supports it) produces identical tool call re
 ## 17. Dependency Graph
 
 ```
-omnitool (installable extras)
+egg-toolbox (installable extras)
   Required:
     jinja2          # chat template rendering
     starlette       # ASGI HTTP framework
@@ -2494,20 +2494,20 @@ omnitool (installable extras)
     httptools       # fast HTTP parsing for uvicorn
 
   Backend extras:
-    omnitool[tinygrad]:    tinygrad
-    omnitool[vllm]:        vllm
-    omnitool[sglang]:      sglang
-    omnitool[llamacpp]:    llama-cpp-python
+    egg-toolbox[tinygrad]:    tinygrad
+    egg-toolbox[vllm]:        vllm
+    egg-toolbox[sglang]:      sglang
+    egg-toolbox[llamacpp]:    llama-cpp-python
 
   Dev extras:
-    omnitool[dev]:         pytest, pytest-asyncio, httpx
+    egg-toolbox[dev]:         pytest, pytest-asyncio, httpx
 ```
 
 ### `pyproject.toml` skeleton
 
 ```toml
 [project]
-name = "omnitool"
+name = "egg-toolbox"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -2524,25 +2524,25 @@ llamacpp = ["llama-cpp-python>=0.3"]
 dev = ["pytest", "pytest-asyncio", "httpx"]
 
 [project.scripts]
-omnitool = "omnitool.__main__:main"
+egg-toolbox = "egg_toolbox.__main__:main"
 ```
 
 ---
 
 ## 18. Integration with egg-mono
 
-omnitool is a standalone library. egg-mono can consume it in two ways:
+egg-toolbox is a standalone library. egg-mono can consume it in two ways:
 
 ### Option A: As a remote server
 
-egg-mono's `eggllm` routes requests to a running `omnitool` server just like any other OpenAI-compatible endpoint. No code changes needed in eggllm.
+egg-mono's `eggllm` routes requests to a running `egg-toolbox` server just like any other OpenAI-compatible endpoint. No code changes needed in eggllm.
 
 ### Option B: As a library dependency
 
 ```python
-# In eggllm/providers/omnitool_local.py
-from omnitool.orchestrator import Orchestrator
-from omnitool.backends.tinygrad import TinygradBackend
+# In eggllm/providers/egg_toolbox_local.py
+from egg_toolbox.orchestrator import Orchestrator
+from egg_toolbox.backends.tinygrad import TinygradBackend
 
 class OmnitoolLocalProvider(ProviderAdapter):
     def __init__(self, model_path: str):
@@ -2638,7 +2638,7 @@ The `tests/fixtures/outputs/` directory should contain recorded token-by-token o
 
 2. **Vision/multimodal**: The current design handles text content parts. Image content parts would need backend-specific handling (tinygrad doesn't support vision; vLLM does).
 
-3. **Tool execution**: omnitool is pure middleware (prompt in, tool calls out). It does not execute tools. Tool execution is the consumer's responsibility (e.g., egg-mono's `eggthreads`).
+3. **Tool execution**: egg-toolbox is pure middleware (prompt in, tool calls out). It does not execute tools. Tool execution is the consumer's responsibility (e.g., egg-mono's `eggthreads`).
 
 4. **Model hot-swapping**: Currently one model per process. Supporting multiple models or hot-swapping would require an orchestrator registry.
 

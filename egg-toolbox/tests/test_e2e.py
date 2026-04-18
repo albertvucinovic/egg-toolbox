@@ -1,4 +1,4 @@
-"""End-to-end tests for the omnitool pipeline.
+"""End-to-end tests for the egg-toolbox pipeline.
 
 Scripted tests validate API -> Orchestrator -> Parser -> SSE using a
 deterministic fake backend (no model needed, fast).
@@ -209,7 +209,7 @@ class TestAuxEndpoints:
         assert body["object"] == "list"
         assert body["data"][0]["id"] == "scripted-test"
         assert body["data"][0]["created"] > 0
-        assert body["data"][0]["owned_by"] == "omnitool"
+        assert body["data"][0]["owned_by"] == "egg-toolbox"
 
 
 class TestErrorHandling:
@@ -374,7 +374,7 @@ class TestSystemFingerprint:
             json=_chat_body("Hi", stream=False),
         )
         body = resp.json()
-        assert body["system_fingerprint"] == "omnitool-v0"
+        assert body["system_fingerprint"] == "egg-toolbox-v0"
 
     def test_streaming_fingerprint(self, make_client):
         client = make_client("OK")
@@ -384,7 +384,7 @@ class TestSystemFingerprint:
         )
         chunks = _parse_sse(resp.text)
         for chunk in chunks:
-            assert chunk["system_fingerprint"] == "omnitool-v0"
+            assert chunk["system_fingerprint"] == "egg-toolbox-v0"
 
 
 # ===================================================================
@@ -409,9 +409,9 @@ class TestRealModel:
 
     @staticmethod
     def _build_client(model_path):
-        from omnitool.backends.tinygrad import TinygradBackend
-        from omnitool.orchestrator import Orchestrator
-        from omnitool.api.middleware import create_app
+        from egg_toolbox.backends.tinygrad import TinygradBackend
+        from egg_toolbox.orchestrator import Orchestrator
+        from egg_toolbox.api.middleware import create_app
         from starlette.testclient import TestClient
 
         backend = TinygradBackend()

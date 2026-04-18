@@ -21,6 +21,7 @@ bd close <id>         # Complete work
 - Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
 - Run `bd prime` for detailed command reference and session close protocol
 - Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- After closing a beads issue, run `bd ready` to find the next available issue and continue working on it
 
 ## Session Completion
 
@@ -53,24 +54,29 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
+Project layout: repo root contains `egg-toolbox/` (the Python project with pyproject.toml, tests/, and the `egg_toolbox/` package), plus `docs/`, `.beads/`, `.venv/`.
+
 ```bash
-# Create/activate venv
-python3 -m venv /workspace/omnitool/.venv
-source /workspace/omnitool/.venv/bin/activate
+# Create/activate venv (at repo root)
+python3 -m venv .venv
+source .venv/bin/activate
 
 # Install with dev deps
-pip install -e "/workspace/omnitool[dev]"
+pip install -e "./egg-toolbox[dev]"
 
 # Run tests
-/workspace/omnitool/.venv/bin/python -m pytest /workspace/omnitool/tests/
+.venv/bin/python -m pytest egg-toolbox/tests/
 
 # Quick import check
-/workspace/omnitool/.venv/bin/python -c "from omnitool.types import *; print('OK')"
+.venv/bin/python -c "from egg_toolbox.types import *; print('OK')"
+
+# Start the server
+.venv/bin/python -m egg_toolbox path/to/model.gguf --backend tinygrad
 ```
 
 ## Architecture Overview
 
-See `omnitool/context.md` for full architecture. Key flow:
+See `egg-toolbox/context.md` for full architecture. Key flow:
 - API Request -> Orchestrator -> ChatTemplate.render() -> Backend.generate_tokens() -> StreamingParser -> SemanticEvent stream -> API SSE projection
 - Universal IR: `SemanticEvent` -- both OpenAI and Anthropic APIs are lossless projections
 
@@ -82,5 +88,5 @@ See `omnitool/context.md` for full architecture. Key flow:
 - Two backend ABCs: StepBackend (token-by-token) vs ConstraintBackend (text chunks)
 - Per-format state machine parsers (not regex) for streaming
 - Format detection at model load (not per-request)
-- Design docs: `docs/omnitool-plan.md`, `docs/omnitool-architecture.md`
-- Session continuation: `docs/omnitool-new-session.md`
+- Design docs: `docs/egg-toolbox-plan.md`, `docs/egg-toolbox-architecture.md`
+- Session continuation: `docs/egg-toolbox-new-session.md`

@@ -1,5 +1,5 @@
 [project]
-name = "omnitool"
+name = "egg-toolbox"
 version = "0.1.0"
 requires-python = ">=3.11"
 description = "Universal tool calling middleware for local LLMs"
@@ -17,7 +17,7 @@ llamacpp = ["llama-cpp-python>=0.3"]
 dev = ["pytest", "pytest-asyncio", "httpx"]
 
 [project.scripts]
-omnitool = "omnitool.__main__:main"
+egg-toolbox = "egg_toolbox.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68"]
