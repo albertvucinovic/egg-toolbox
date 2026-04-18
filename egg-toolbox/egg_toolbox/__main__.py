@@ -36,6 +36,17 @@ def main():
                              "because dequant runs per matmul per token; "
                              "prefill also spikes memory transiently.  Use "
                              "only when fp16 weights don't fit.")
+    parser.add_argument("--disable-thinking", action="store_true",
+                        help="For Qwen3-style templates that honour an "
+                             "'enable_thinking' variable: pass "
+                             "enable_thinking=False so the model answers "
+                             "directly instead of emitting a <think>...</think> "
+                             "block first.  Strongly recommended for "
+                             "agentic/tool-calling workloads at tight "
+                             "max_tokens -- thinking can consume hundreds of "
+                             "tokens before any content appears, which clients "
+                             "(egg-mono, OpenAI SDK) see as 'empty assistant "
+                             "message'.")
     parser.add_argument("--gpu-layers", type=int, default=-1,
                         help="GPU layers for llamacpp backend (default: -1 = all)")
     parser.add_argument("--tensor-parallel", type=int, default=1,
@@ -55,7 +66,10 @@ def main():
     # Create orchestrator
     from .orchestrator import Orchestrator
     from .api.middleware import create_app
-    orchestrator = Orchestrator(backend)
+    orchestrator = Orchestrator(
+        backend,
+        enable_thinking=False if args.disable_thinking else None,
+    )
 
     # Create and run ASGI app
     import uvicorn

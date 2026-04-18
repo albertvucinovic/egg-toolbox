@@ -31,5 +31,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec "$SCRIPT_DIR/.venv/bin/python" -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
   --backend tinygrad \
   --host 127.0.0.1 --port 8765 \
-  --context-length 2048 
+  --context-length 2048 \
+  --disable-thinking
 #  --keep-packed

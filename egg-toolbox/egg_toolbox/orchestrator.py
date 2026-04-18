@@ -72,9 +72,15 @@ class Orchestrator:
     One Orchestrator instance per loaded model. Constructed at model load time.
     """
 
-    def __init__(self, backend: Backend):
+    def __init__(self, backend: Backend, *, enable_thinking: bool | None = None):
         self._backend = backend
         self._tokenizer = backend.tokenizer()
+        # If the chat template takes an ``enable_thinking`` variable
+        # (Qwen3-style), this flag controls whether thinking is on
+        # for every request.  None = template default (usually True
+        # for Qwen3); False explicitly disables; True explicitly
+        # enables.  Exposed through __main__ via --disable-thinking.
+        self._enable_thinking = enable_thinking
 
         # Dedicated single-thread executor for all backend generation
         # calls.  Must be max_workers=1 so every request's producer
@@ -119,6 +125,7 @@ class Orchestrator:
             messages=messages,
             tools=tools,
             add_generation_prompt=True,
+            enable_thinking=self._enable_thinking,
         )
         prompt_tokens = self._tokenizer.encode(prompt_str)
 
