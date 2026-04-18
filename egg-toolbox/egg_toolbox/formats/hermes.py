@@ -394,8 +394,10 @@ class HermesHandler(FormatHandler):
         return HermesParserState(self.analysis, tools)
 
     def generate_grammar(self, tools: list[Tool]) -> str | None:
-        # Phase 2: implement GBNF grammar generation
-        return None
+        if not tools:
+            return None
+        from ..grammar import generate_gbnf
+        return generate_gbnf(tools, self.analysis)
 
 
 class _HermesState(enum.Enum):
