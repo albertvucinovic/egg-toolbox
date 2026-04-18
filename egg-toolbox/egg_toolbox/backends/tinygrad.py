@@ -266,6 +266,12 @@ class TinygradBackend(StepBackend):
         # share entropy.  Built once, reused for every decode step.
         rng = _rng_for(request.sampling.seed)
 
+        # Rolling window of the last N tokens seen by the model
+        # (prompt plus generated).  Used to apply repetition,
+        # frequency, and presence penalties before sampling.  Matches
+        # llama.cpps penalty_last_n default of 64.
+        _PENALTY_WINDOW = 64
+
         enable_cache = os.environ.get("EGG_PREFIX_CACHE", "1") != "0"
 
         # --- Find longest common prefix with the resident cache. ----
@@ -289,6 +295,14 @@ class TinygradBackend(StepBackend):
 
         new_suffix = prompt_list[cp:]
 
+        # Rolling penalty window.  Seeded with prompt tail.
+        recent = list(prompt_list[-_PENALTY_WINDOW:])
+
+        def _record_seen(tid: int) -> None:
+            recent.append(tid)
+            if len(recent) > _PENALTY_WINDOW:
+                del recent[0]
+
         # --- Prefill the diverging suffix. --------------------------
         # T > 1 -> non-JIT forward path (matches upstream generate).
         # The forward has been patched (see _do_load_model) to return
@@ -302,7 +316,9 @@ class TinygradBackend(StepBackend):
             np.asarray(logits.tolist()[0], dtype=np.float32),
             request.sampling,
             rng,
+            recent_tokens=recent,
         )
+        _record_seen(next_id)
         yield next_id
 
         # --- Decode loop. -------------------------------------------
@@ -329,7 +345,9 @@ class TinygradBackend(StepBackend):
                 np.asarray(logits.tolist()[0], dtype=np.float32),
                 request.sampling,
                 rng,
+                recent_tokens=recent,
             )
+            _record_seen(next_id)
             yield next_id
 
     def model_name(self) -> str:

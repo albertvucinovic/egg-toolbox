@@ -118,6 +118,92 @@ def test_degenerate_logits_do_not_crash():
     assert tok == 0
 
 
+def test_repetition_penalty_discourages_recent_tokens():
+    """repetition_penalty > 1 should make tokens in ``recent_tokens``
+    less likely.  With two candidates of equal logit and only candidate
+    1 penalized, greedy selection must pick the other."""
+    logits = np.array([1.0, 1.0, 1.0])
+    tok = sample_next_token(
+        logits,
+        SamplingParams(temperature=0.0, repetition_penalty=2.0),
+        recent_tokens=[1],
+    )
+    assert tok != 1, (
+        f"token 1 was recently seen and penalty=2.0; argmax still picked it"
+    )
+
+
+def test_repetition_penalty_one_is_neutral():
+    """Default repetition_penalty=1.0 must not change argmax."""
+    logits = np.array([1.0, 2.0, 1.0])
+    tok = sample_next_token(
+        logits,
+        SamplingParams(temperature=0.0, repetition_penalty=1.0),
+        recent_tokens=[1, 1, 1],
+    )
+    assert tok == 1
+
+
+def test_frequency_penalty_scales_with_count():
+    """frequency_penalty reduces logit by penalty * count(token).
+    Candidate 0 appears 3 times, candidate 1 appears once.  With a
+    large-enough penalty, 0 should fall below 1 even if its base logit
+    is slightly higher."""
+    logits = np.array([2.5, 2.0, 1.0])
+    tok = sample_next_token(
+        logits,
+        SamplingParams(temperature=0.0, frequency_penalty=1.0),
+        recent_tokens=[0, 0, 0, 1],
+    )
+    assert tok == 1, (
+        f"frequency penalty (count=3 vs 1) should have pushed 0 below 1; "
+        f"got {tok}"
+    )
+
+
+def test_presence_penalty_is_flat():
+    """presence_penalty is applied once per token that appears at all,
+    regardless of count.  Tokens appearing 1x and 3x get the same
+    penalty; the difference from frequency_penalty is in the formula,
+    not the data."""
+    logits = np.array([1.5, 1.0])
+    # Without penalty, argmax is 0.
+    tok0 = sample_next_token(
+        logits,
+        SamplingParams(temperature=0.0),
+    )
+    assert tok0 == 0
+    # With presence_penalty=1 and token 0 present, its logit drops
+    # below token 1.
+    tok1 = sample_next_token(
+        logits,
+        SamplingParams(temperature=0.0, presence_penalty=1.0),
+        recent_tokens=[0],
+    )
+    assert tok1 == 1
+
+
+def test_no_recent_tokens_list_means_no_penalty():
+    """If recent_tokens is None/empty, penalties must be skipped (no
+    IndexError, no silent effect)."""
+    logits = np.array([1.0, 2.0, 3.0])
+    for rt in (None, [], [], [10]):  # the [10] has no effect on tokens 0-2
+        tok = sample_next_token(
+            logits,
+            SamplingParams(
+                temperature=0.0,
+                repetition_penalty=2.0,
+                frequency_penalty=1.0,
+                presence_penalty=1.0,
+            ),
+            recent_tokens=rt,
+        )
+        assert tok == 2, (
+            f"recent_tokens={rt!r} -- penalty applied to unrelated tokens "
+            f"or sampler crashed; got {tok}"
+        )
+
+
 def test_uniform_logits_with_strict_filters():
     """Uniform logits + top_k=1 + top_p=0.5: the filter chain must pick
     the first top-k slot (by argmax tiebreak) without crashing."""

@@ -27,6 +27,7 @@ def sample_next_token(
     logits: np.ndarray,
     sampling: SamplingParams,
     rng: np.random.Generator | None = None,
+    recent_tokens: list[int] | None = None,
 ) -> int:
     """Sample a token id from ``logits`` under ``sampling``.
 
@@ -34,15 +35,27 @@ def sample_next_token(
     If ``rng`` is None one is built from ``sampling.seed`` (None seed ->
     OS entropy).  Callers that generate many tokens in one request should
     pass a reused rng so the seeding cost is paid once.
+
+    ``recent_tokens`` is the window of token ids (prompt + generated so
+    far, typically last 64) used to apply ``repetition_penalty``,
+    ``frequency_penalty``, and ``presence_penalty``.  When None or
+    empty the penalties are skipped.
     """
     if rng is None:
         rng = _rng_for(sampling.seed)
 
+    # Apply the three repetition-discouraging penalties BEFORE greedy
+    # shortcut -- a repetition_penalty of 2.0 with argmax should still
+    # change which token wins, so we must modify logits first.
+    scored = logits.astype(np.float32, copy=True)
+    if recent_tokens:
+        _apply_penalties(scored, sampling, recent_tokens)
+
     # Greedy shortcut: temperature=0 or top_k=1 both collapse to argmax.
     if sampling.temperature <= 0.0 or sampling.top_k == 1:
-        return int(np.argmax(logits))
+        return int(np.argmax(scored))
 
-    scaled = logits.astype(np.float32, copy=False) / sampling.temperature
+    scaled = scored / sampling.temperature
 
     # Top-k: drop every logit below the k-th largest.
     if sampling.top_k > 0 and sampling.top_k < scaled.shape[0]:
@@ -79,6 +92,50 @@ def sample_next_token(
     u = rng.random()
     cumulative = np.cumsum(probs)
     return int(np.searchsorted(cumulative, u).clip(0, probs.shape[0] - 1))
+
+
+def _apply_penalties(
+    scored: np.ndarray,
+    sampling: SamplingParams,
+    recent_tokens: list[int],
+) -> None:
+    """Apply repetition, frequency, and presence penalties to ``scored``
+    in-place.
+
+    - repetition_penalty (llama.cpp style): for each token in
+      ``recent_tokens``, divide positive logits by the penalty and
+      multiply negative logits by it.  Neutral value is 1.0.
+    - frequency_penalty (OpenAI style): subtract penalty * count(token).
+      Neutral value is 0.0.
+    - presence_penalty (OpenAI style): subtract penalty once for every
+      token that appears at least once.  Neutral value is 0.0.
+
+    All three skip indices outside ``scored.shape[0]`` silently so a
+    caller passing prompt-space tokens whose ids exceed vocab_size
+    (shouldnt happen, but defensive) does not IndexError.
+    """
+    vocab = scored.shape[0]
+    rep = sampling.repetition_penalty
+    freq = sampling.frequency_penalty
+    pres = sampling.presence_penalty
+
+    if rep == 1.0 and freq == 0.0 and pres == 0.0:
+        return
+
+    # Count token occurrences in the window.  Small, so a dict is fine.
+    counts: dict[int, int] = {}
+    for tid in recent_tokens:
+        if 0 <= tid < vocab:
+            counts[tid] = counts.get(tid, 0) + 1
+
+    for tid, count in counts.items():
+        val = scored[tid]
+        if rep != 1.0:
+            scored[tid] = val / rep if val > 0 else val * rep
+        if freq != 0.0:
+            scored[tid] -= freq * count
+        if pres != 0.0:
+            scored[tid] -= pres
 
 
 def _rng_for(seed: int | None) -> np.random.Generator:
