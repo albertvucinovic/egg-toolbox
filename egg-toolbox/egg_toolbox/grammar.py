@@ -29,6 +29,44 @@ from .types import FormatAnalysis, Tool, ToolFormatMode
 
 # -------- public API --------
 
+def generate_json_mode_gbnf(schema: dict | None) -> str:
+    """Produce a GBNF grammar that constrains the entire response to
+    valid JSON.
+
+    - ``schema=None`` (OpenAI ``response_format={type: 'json_object'}``):
+      any JSON object or array at the top level.
+    - ``schema`` provided (OpenAI ``response_format={type: 'json_schema',
+      json_schema: {schema: {...}}}``): grammar that matches that schema.
+    """
+    if schema is None:
+        lines: list[str] = []
+        lines.append('root ::= ws (json-object | json-array) ws')
+        lines.extend(_json_primitives_gbnf())
+        lines.append(
+            'json-object ::= "{" ws "}" | "{" ws json-pair (ws "," ws json-pair)* ws "}"'
+        )
+        lines.append('json-pair ::= json-string ws ":" ws json-value')
+        lines.append(
+            'json-array ::= "[" ws "]" | "[" ws json-value (ws "," ws json-value)* ws "]"'
+        )
+        # Override the simplified json-value from _json_primitives_gbnf
+        # with a full recursive definition.
+        lines = [
+            l for l in lines
+            if not l.startswith("json-value ::=")
+        ]
+        lines.append(
+            'json-value ::= json-string | json-number | json-bool | json-null | '
+            'json-object | json-array'
+        )
+        return "\n".join(lines)
+
+    # Schema-constrained: top-level follows the schema.
+    lines = _json_schema_to_gbnf(schema, "root")
+    lines.extend(_json_primitives_gbnf())
+    return "\n".join(lines)
+
+
 def generate_gbnf(tools: list[Tool], analysis: FormatAnalysis) -> str:
     """Generate a GBNF grammar for the given tools.
 

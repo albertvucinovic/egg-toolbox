@@ -31,6 +31,17 @@ async def chat_completions(body: dict, orchestrator: Orchestrator) -> StreamingR
     if tool_choice == "none":
         tools = None
 
+    # response_format: OpenAI's structured-output hook.  Valid shapes:
+    #   {"type": "text"}                        -- no constraint (default)
+    #   {"type": "json_object"}                 -- any JSON object/array
+    #   {"type": "json_schema",
+    #    "json_schema": {"name": "...",
+    #                    "schema": {...},
+    #                    "strict": true}}
+    # We pass through to the orchestrator, which translates to a GBNF
+    # grammar on the CompiledRequest.
+    response_format = body.get("response_format")
+
     # Parse stream_options
     stream_options = body.get("stream_options") or {}
     include_usage = stream_options.get("include_usage", False) if stream else False
@@ -38,12 +49,16 @@ async def chat_completions(body: dict, orchestrator: Orchestrator) -> StreamingR
     if stream:
         return StreamingResponse(
             _stream_response(orchestrator, messages, tools, sampling, model_name,
-                             include_usage=include_usage),
+                             include_usage=include_usage,
+                             response_format=response_format),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     else:
-        return await _non_stream_response(orchestrator, messages, tools, sampling, model_name)
+        return await _non_stream_response(
+            orchestrator, messages, tools, sampling, model_name,
+            response_format=response_format,
+        )
 
 
 async def _stream_response(
@@ -54,6 +69,7 @@ async def _stream_response(
     model_name: str,
     *,
     include_usage: bool = False,
+    response_format: dict | None = None,
 ):
     """Generate SSE events in OpenAI streaming format."""
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -75,7 +91,10 @@ async def _stream_response(
 
     # Stream semantic events; capture the DONE event for usage
     done_event: SemanticEvent | None = None
-    async for event in orchestrator.chat_completion(messages, tools, sampling, stream=True):
+    async for event in orchestrator.chat_completion(
+        messages, tools, sampling, stream=True,
+        response_format=response_format,
+    ):
         if event.kind == EventKind.DONE:
             done_event = event
         chunks = _event_to_openai_chunks(event, request_id, created, model_name)
@@ -110,6 +129,8 @@ async def _non_stream_response(
     tools: list[Tool] | None,
     sampling: SamplingParams,
     model_name: str,
+    *,
+    response_format: dict | None = None,
 ) -> JSONResponse:
     """Collect all events and return a single JSON response."""
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -122,7 +143,10 @@ async def _non_stream_response(
     prompt_tokens = 0
     completion_tokens = 0
 
-    async for event in orchestrator.chat_completion(messages, tools, sampling, stream=False):
+    async for event in orchestrator.chat_completion(
+        messages, tools, sampling, stream=False,
+        response_format=response_format,
+    ):
         if event.kind == EventKind.CONTENT_DELTA and event.text:
             content_parts.append(event.text)
         elif event.kind == EventKind.REASONING_DELTA and event.text:

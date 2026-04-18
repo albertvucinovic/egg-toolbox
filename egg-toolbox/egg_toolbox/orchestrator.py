@@ -119,8 +119,22 @@ class Orchestrator:
         tools: list[Tool] | None = None,
         sampling: SamplingParams = SamplingParams(),
         stream: bool = True,
+        response_format: dict | None = None,
     ) -> AsyncIterator[SemanticEvent]:
-        """Execute a chat completion request and yield semantic events."""
+        """Execute a chat completion request and yield semantic events.
+
+        ``response_format`` follows the OpenAI convention:
+          - ``{"type": "json_object"}`` -- any JSON output required.
+          - ``{"type": "json_schema", "json_schema": {"schema": {...}}}``
+            -- output must match the provided schema.
+          - ``{"type": "text"}`` or ``None`` -- no constraint.
+
+        When set (and the request has no ``tools``), a GBNF grammar is
+        generated and attached to the CompiledRequest so grammar-aware
+        backends constrain decoding.  Step backends without grammar
+        support ignore the field; the client still gets a best-effort
+        response.
+        """
 
         # 1. Render the prompt using the model's chat template
         prompt_str = self._template.render(
@@ -137,12 +151,29 @@ class Orchestrator:
         if sampling.stop_token_ids:
             stop_token_ids = stop_token_ids + sampling.stop_token_ids
 
-        # 3. Optionally generate grammar constraints
+        # 3. Optionally generate grammar constraints.  Tool-call grammar
+        # takes precedence over response_format (they're mutually
+        # exclusive in practice -- you can't ask for structured JSON AND
+        # tool_calls on the same turn).
         grammar = None
         json_schema = None
         if tools:
             grammar = self._handler.generate_grammar(tools)
             json_schema = self._handler.generate_json_schema(tools)
+        elif response_format is not None:
+            rf_type = response_format.get("type", "text")
+            if rf_type == "json_object":
+                from .grammar import generate_json_mode_gbnf
+                grammar = generate_json_mode_gbnf(None)
+            elif rf_type == "json_schema":
+                schema = (
+                    response_format.get("json_schema", {})
+                    .get("schema")
+                )
+                if schema is not None:
+                    from .grammar import generate_json_mode_gbnf
+                    grammar = generate_json_mode_gbnf(schema)
+                    json_schema = schema
 
         # 4. Build compiled request
         request = CompiledRequest(
