@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import threading
 from typing import AsyncIterator
 
 from .types import (
@@ -151,48 +153,94 @@ class Orchestrator:
         request: CompiledRequest,
         parser: StreamingParser,
     ) -> AsyncIterator[SemanticEvent]:
-        """Execute generation on a step backend (tinygrad, llama-cpp-python)."""
+        """Execute generation on a step backend (tinygrad, llama-cpp-python).
+
+        The backend's ``generate_tokens`` is a synchronous iterator whose
+        ``next()`` can block for tens of milliseconds to several seconds
+        per token (kernel compile, GPU decode).  Running it directly in
+        an ``async def`` would block the asyncio event loop and prevent
+        uvicorn from flushing SSE chunks between tokens -- the client
+        would see bursts rather than a live stream.
+
+        Instead we spawn a worker thread that pulls tokens from the
+        backend and pushes them onto an asyncio queue via
+        ``call_soon_threadsafe``.  The async iterator awaits the queue,
+        so the event loop stays responsive between tokens and each
+        yielded event flushes to the client immediately.
+        """
         assert isinstance(self._backend, StepBackend)
+
+        loop = asyncio.get_running_loop()
+        token_queue: asyncio.Queue = asyncio.Queue()
+        _SENTINEL = object()
+
+        def producer() -> None:
+            def _push(item: object) -> None:
+                # Schedule on the event loop, swallowing "loop closed"
+                # if the async side has already torn down (client
+                # disconnect, early break).  Losing tokens after that
+                # point is fine; the consumer has stopped reading.
+                try:
+                    loop.call_soon_threadsafe(token_queue.put_nowait, item)
+                except RuntimeError:
+                    pass
+            try:
+                for tid in self._backend.generate_tokens(request):
+                    _push(tid)
+            except BaseException as exc:  # noqa: BLE001
+                _push(("__error__", exc))
+            finally:
+                _push(_SENTINEL)
+
+        thread = threading.Thread(target=producer, daemon=True, name="egg-toolbox-gen")
+        thread.start()
 
         token_count = 0
         max_tokens = request.sampling.max_tokens
         stop_matcher = StopStringMatcher(request.stop_strings)
 
-        for token_id in self._backend.generate_tokens(request):
-            # Check stop token
-            if token_id in request.stop_token_ids:
-                break
+        try:
+            while True:
+                item = await token_queue.get()
+                if item is _SENTINEL:
+                    break
+                if isinstance(item, tuple) and item and item[0] == "__error__":
+                    raise item[1]
+                token_id = item
 
-            token_text = self._tokenizer.decode_single(token_id)
+                if token_id in request.stop_token_ids:
+                    break
 
-            # Check stop strings with partial matching
-            safe_text, matched_stop = stop_matcher.feed(token_text)
+                token_text = self._tokenizer.decode_single(token_id)
+                safe_text, matched_stop = stop_matcher.feed(token_text)
 
-            if matched_stop:
-                # Feed any safe text before the stop string
+                if matched_stop:
+                    if safe_text:
+                        for event in parser.feed_token(token_id, safe_text):
+                            yield event
+                    break
+
                 if safe_text:
-                    events = parser.feed_token(token_id, safe_text)
-                    for event in events:
+                    for event in parser.feed_token(token_id, safe_text):
                         yield event
-                break
 
-            if safe_text:
-                events = parser.feed_token(token_id, safe_text)
-                for event in events:
-                    yield event
-
-            token_count += 1
-            if max_tokens and token_count >= max_tokens:
-                break
+                token_count += 1
+                if max_tokens and token_count >= max_tokens:
+                    break
+        finally:
+            # Thread keeps running (the sync generator can't be
+            # cancelled externally).  Drain any backlog so the thread
+            # can exit naturally when the model eventually emits EOS
+            # or hits context limit.  The daemon=True flag ensures
+            # the process can still exit.
+            pass
 
         # Flush any remaining text in stop matcher
         remaining = stop_matcher.flush()
         if remaining:
-            events = parser.feed_token(-1, remaining)
-            for event in events:
+            for event in parser.feed_token(-1, remaining):
                 yield event
 
-        # Finalize
         num_prompt = len(request.prompt_tokens)
         for event in parser.finish():
             if event.kind == EventKind.DONE:
