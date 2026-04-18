@@ -105,6 +105,48 @@ class TestToolResultReachesPrompt:
         assert prompt.rstrip().endswith("<|im_start|>assistant")
 
 
+class TestAssistantWithOnlyToolCallsRenders:
+    """Regression: some chat templates (notably Qwen3's) do a bare
+    ``message.content`` attribute access which Jinja translates to
+    dict-key lookup.  If the key is absent (because our assistant
+    message carries only tool_calls), the template raises
+    UndefinedError -- the HTTP handler catches it as a 500.
+
+    _msg_to_dict must always include a 'content' key, substituting
+    an empty string when ChatMessage.content is None."""
+
+    def test_no_undefined_error_on_tool_call_only_assistant(self, qwen_template):
+        from egg_toolbox.types import ChatMessage, ToolCall, ToolCallFunction
+        msgs = [
+            ChatMessage(role="user", content="Weather?"),
+            ChatMessage(
+                role="assistant",
+                content=None,
+                tool_calls=(
+                    ToolCall(id="call_0", type="function",
+                             function=ToolCallFunction(
+                                 name="get_weather",
+                                 arguments='{"city": "Zagreb"}')),
+                ),
+            ),
+            ChatMessage(role="tool", content="sunny", tool_call_id="call_0"),
+        ]
+        # Must not raise.
+        prompt = qwen_template.render(messages=msgs, tools=None,
+                                      add_generation_prompt=True)
+        # Tool call is rendered despite empty content.
+        assert "get_weather" in prompt
+        # Tool result is rendered.
+        assert "sunny" in prompt
+
+    def test_msg_to_dict_always_includes_content_key(self):
+        from egg_toolbox.template import ChatTemplate
+        from egg_toolbox.types import ChatMessage
+        d = ChatTemplate._msg_to_dict(ChatMessage(role="assistant", content=None))
+        assert "content" in d
+        assert d["content"] == ""
+
+
 class TestMultipleToolResultsInOrder:
     """Parallel tool calls followed by their paired results."""
 

@@ -152,15 +152,22 @@ class ChatTemplate:
     @staticmethod
     def _msg_to_dict(msg: ChatMessage) -> dict[str, Any]:
         d: dict[str, Any] = {"role": msg.role}
-        if msg.content is not None:
-            if isinstance(msg.content, str):
-                d["content"] = msg.content
-            else:
-                d["content"] = [
-                    {"type": p.type, "text": p.text} if p.text is not None
-                    else {"type": p.type, "image_url": p.image_url}
-                    for p in msg.content
-                ]
+        # Always include a 'content' key -- some chat templates
+        # (notably Qwen3's) do bare `message.content` attribute
+        # access, which Jinja translates to dict-key lookup and
+        # which raises UndefinedError if the key is absent.  We
+        # substitute an empty string for a missing/None content
+        # so ``{% if message.content %}`` still evaluates falsy.
+        if msg.content is None:
+            d["content"] = ""
+        elif isinstance(msg.content, str):
+            d["content"] = msg.content
+        else:
+            d["content"] = [
+                {"type": p.type, "text": p.text} if p.text is not None
+                else {"type": p.type, "image_url": p.image_url}
+                for p in msg.content
+            ]
         if msg.tool_calls is not None:
             d["tool_calls"] = [
                 {
