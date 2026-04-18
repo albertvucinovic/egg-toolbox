@@ -195,6 +195,12 @@ class Orchestrator:
         token_queue: asyncio.Queue = asyncio.Queue()
         _SENTINEL = object()
 
+        # Hold a reference to the backend generator so we can call
+        # close() on early exit -- that triggers its finally block,
+        # which sets its cancellation flag and stops the GPU from
+        # producing tokens that nobody will read.
+        backend_gen = self._backend.generate_tokens(request)
+
         def producer() -> None:
             def _push(item: object) -> None:
                 # Schedule on the event loop, swallowing "loop closed"
@@ -206,7 +212,7 @@ class Orchestrator:
                 except RuntimeError:
                     pass
             try:
-                for tid in self._backend.generate_tokens(request):
+                for tid in backend_gen:
                     _push(tid)
             except BaseException as exc:  # noqa: BLE001
                 _push(("__error__", exc))
@@ -278,12 +284,20 @@ class Orchestrator:
                 if max_tokens and token_count >= max_tokens:
                     break
         finally:
-            # Thread keeps running (the sync generator can't be
-            # cancelled externally).  Drain any backlog so the thread
-            # can exit naturally when the model eventually emits EOS
-            # or hits context limit.  The daemon=True flag ensures
-            # the process can still exit.
-            pass
+            # Close the backend generator immediately.  Python's
+            # GC would call close() eventually, but we want
+            # deterministic cancellation so the GPU stops spending
+            # cycles on tokens we've already decided to drop
+            # (stop string matched, EOS reached, max_tokens,
+            # tool_call completed, or client disconnected).  The
+            # backend's generate_tokens() has a finally that sets
+            # a threading.Event the worker checks after each
+            # yielded token; it bails out within one more forward
+            # pass at most.
+            try:
+                backend_gen.close()
+            except Exception:
+                pass
 
         # Flush any remaining text in stop matcher
         remaining = stop_matcher.flush()

@@ -118,17 +118,37 @@ class TinygradBackend(StepBackend):
         The actual call to ``Transformer.generate()`` runs on the
         dedicated tinygrad worker thread (where the sqlite kernel
         cache connection lives).  Tokens are ferried back to the
-        caller's thread through a bounded queue; the caller iterates
-        as if the generator were native.
+        caller's thread through a queue; the caller iterates as if
+        the generator were native.
+
+        **Cancellation**: when the caller stops iterating (breaks
+        out of their for-loop -- stop string matched, EOS, tool
+        call complete, max_tokens reached), Python's generator
+        close() fires the ``finally`` below, which sets
+        ``cancelled``.  The worker's inner loop checks that flag
+        after every yielded token and bails out, so the GPU stops
+        doing forward passes for tokens nobody will read.  Without
+        this, tinygrad kept computing tokens until ``max_context``
+        every request, locking the backend's single-thread executor
+        for minutes and producing the "stuck after tool_call" loop
+        users hit.
+
+        The queue is unbounded because the consumer may be many
+        tokens ahead-of-producer when cancellation arrives; we
+        don't want the worker to block on put() before it can
+        check the flag.
         """
         assert self._model is not None, "Model not loaded"
 
-        token_q: queue.Queue = queue.Queue(maxsize=64)
+        token_q: queue.Queue = queue.Queue()
         SENTINEL = object()
+        cancelled = threading.Event()
 
         def _run() -> None:
             try:
                 for tid in self._model.generate(list(request.prompt_tokens)):
+                    if cancelled.is_set():
+                        break
                     token_q.put(tid)
             except BaseException as exc:  # noqa: BLE001
                 token_q.put(("__error__", exc))
@@ -137,13 +157,19 @@ class TinygradBackend(StepBackend):
 
         self._executor.submit(_run)
 
-        while True:
-            item = token_q.get()
-            if item is SENTINEL:
-                return
-            if isinstance(item, tuple) and item and item[0] == "__error__":
-                raise item[1]
-            yield item
+        try:
+            while True:
+                item = token_q.get()
+                if item is SENTINEL:
+                    return
+                if isinstance(item, tuple) and item and item[0] == "__error__":
+                    raise item[1]
+                yield item
+        finally:
+            # Triggered either by normal exhaustion (already done)
+            # or by caller's break / close().  Set the flag so the
+            # worker stops after its current token.
+            cancelled.set()
 
     def model_name(self) -> str:
         return self._model_name_str

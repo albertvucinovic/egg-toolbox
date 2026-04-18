@@ -105,6 +105,104 @@ def test_load_and_generate_run_on_same_thread(monkeypatch):
     )
 
 
+def test_generate_tokens_stops_backend_when_caller_stops_iterating(monkeypatch):
+    """Regression: when the orchestrator breaks out of its
+    generate_tokens iteration (stop string matched, EOS, tool_call
+    complete), the backend worker must stop producing tokens.
+    Otherwise tinygrad keeps running forward passes for tokens
+    nobody reads, locking the backend's single-thread executor for
+    minutes and causing the 'stuck after tool_call' loop.
+    """
+    from egg_toolbox.backends import tinygrad as tg_backend
+
+    tokens_produced: list[int] = []
+    tokens_yielded_out = 0
+
+    def fake_from_gguf(gguf, **kwargs):
+        class FakeKV(dict):
+            def get(self, key, default=None):
+                return {
+                    "general.architecture": "llama",
+                    "tokenizer.ggml.tokens": ["<eos>"] * 100,
+                    "tokenizer.ggml.eos_token_id": 0,
+                }.get(key, default)
+            def __getitem__(self, key):
+                return self.get(key, 0)
+
+        class FakeModel:
+            def generate(self, prompt_tokens):
+                # Simulate tinygrad's per-token GPU cost (~1 tok/s)
+                # so the producer doesn't get thousands of tokens
+                # ahead of the consumer -- the test's purpose is to
+                # verify cancellation, not queue-throughput.
+                import time as _t
+                i = 0
+                while i < 10_000:
+                    i += 1
+                    tokens_produced.append(i)
+                    _t.sleep(0.005)   # 5 ms per token
+                    yield i
+        return FakeModel(), FakeKV()
+
+    monkeypatch.setattr(tg_backend, "_from_gguf_with_qkv_bias", fake_from_gguf)
+
+    import sys, types
+    fake_tg = types.ModuleType("tinygrad")
+    class _FakeTensor:
+        def __init__(self, *args, **kwargs): pass
+    fake_tg.Tensor = _FakeTensor
+    monkeypatch.setitem(sys.modules, "tinygrad", fake_tg)
+
+    fake_llm = types.ModuleType("tinygrad.apps.llm")
+    class _FakeSimpleTokenizer:
+        @staticmethod
+        def from_gguf_kv(kv): return _FakeSimpleTokenizer()
+    fake_llm.SimpleTokenizer = _FakeSimpleTokenizer
+    monkeypatch.setitem(sys.modules, "tinygrad.apps.llm", fake_llm)
+
+    import egg_toolbox.template as tpl_mod
+    class _FakeCT:
+        source = ""
+    monkeypatch.setattr(tpl_mod.ChatTemplate, "from_gguf",
+                        staticmethod(lambda p: _FakeCT()))
+
+    backend = tg_backend.TinygradBackend()
+    backend.load_model("fake.gguf")
+
+    from egg_toolbox.types import CompiledRequest, SamplingParams
+    req = CompiledRequest(prompt_tokens=(1,), sampling=SamplingParams(),
+                         stop_strings=(), stop_token_ids=())
+
+    # Simulate the orchestrator consuming 5 tokens, then breaking out.
+    gen = backend.generate_tokens(req)
+    nonlocal_count = 0
+    for tid in gen:
+        nonlocal_count += 1
+        if nonlocal_count >= 5:
+            break
+
+    # Explicitly close (orchestrator does this too via finally).
+    gen.close()
+
+    # Wait a moment for the worker to notice the cancellation flag
+    # and exit.  If cancellation is broken, tokens_produced keeps
+    # growing toward 100_000.
+    import time
+    time.sleep(0.25)
+    produced_after_close = len(tokens_produced)
+    time.sleep(0.25)
+    # No further progress after a full second.
+    assert len(tokens_produced) == produced_after_close, (
+        f"Backend kept producing tokens after close(): {produced_after_close} -> {len(tokens_produced)}"
+    )
+    # Some slack: within ~a dozen extra tokens due to the check
+    # happening *after* each yield.
+    assert produced_after_close < 100, (
+        f"Backend produced {produced_after_close} tokens but caller "
+        "only asked for 5 -- cancellation flag isn't being honoured."
+    )
+
+
 def test_multiple_generate_calls_share_backend_thread(monkeypatch):
     """Each generate_tokens call must land on the SAME backend
     worker thread so the sqlite connection opened during load is
