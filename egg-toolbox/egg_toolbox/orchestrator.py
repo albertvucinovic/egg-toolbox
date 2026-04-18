@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncIterator
 
@@ -221,6 +223,26 @@ class Orchestrator:
         max_tokens = request.sampling.max_tokens
         stop_matcher = StopStringMatcher(request.stop_strings)
 
+        # Optional raw-generation logger.  Set EGG_LOG_GEN=<path>
+        # (or EGG_LOG_GEN=1 for default /tmp/egg-gen.log) to dump
+        # every decoded token verbatim, plus the rendered prompt at
+        # the head of the file.  Only enable for debugging; writes
+        # happen inline in the decode loop.
+        gen_log_path: str | None = None
+        env_val = os.environ.get("EGG_LOG_GEN", "").strip()
+        if env_val:
+            gen_log_path = "/tmp/egg-gen.log" if env_val == "1" else env_val
+            try:
+                prompt_text = self._tokenizer.decode(list(request.prompt_tokens))
+            except Exception:
+                prompt_text = f"<{len(request.prompt_tokens)} tokens, decode failed>"
+            with open(gen_log_path, "a", encoding="utf-8") as _f:
+                _f.write("\n========== REQUEST @ {} ==========\n".format(
+                    time.strftime("%Y-%m-%d %H:%M:%S")))
+                _f.write(f"prompt ({len(request.prompt_tokens)} tokens):\n")
+                _f.write(prompt_text)
+                _f.write("\n--- generated tokens (one per line) ---\n")
+
         try:
             while True:
                 item = await token_queue.get()
@@ -234,6 +256,12 @@ class Orchestrator:
                     break
 
                 token_text = self._tokenizer.decode_single(token_id)
+                if gen_log_path:
+                    try:
+                        with open(gen_log_path, "a", encoding="utf-8") as _f:
+                            _f.write(f"[{token_id}] {token_text!r}\n")
+                    except OSError:
+                        pass
                 safe_text, matched_stop = stop_matcher.feed(token_text)
 
                 if matched_stop:
