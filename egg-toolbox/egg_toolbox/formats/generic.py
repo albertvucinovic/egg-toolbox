@@ -22,6 +22,7 @@ from __future__ import annotations
 import enum
 import json
 import re
+import uuid
 from typing import Any
 
 from ..types import SemanticEvent, EventKind, StopReason, Tool, FormatAnalysis
@@ -209,7 +210,7 @@ class GenericParserState(FormatParserState):
             return []
         events: list[SemanticEvent] = []
         for name, args in calls:
-            tool_call_id = f"call_{self._tool_index}"
+            tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             events.extend([
                 SemanticEvent(
                     kind=EventKind.TOOL_CALL_START,

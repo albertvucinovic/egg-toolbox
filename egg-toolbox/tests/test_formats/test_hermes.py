@@ -340,6 +340,62 @@ def test_nested_object_arguments_stream_verbatim():
     assert "65" in combined
 
 
+def test_tool_call_ids_are_unique_across_parser_instances():
+    """P0 bug: tool_call_id collision across conversation turns.
+
+    Every request builds a fresh parser state where ``_tool_index``
+    starts at 0, so the first tool_call in *every* turn used to get
+    ``id='call_0'``.  In a 2-turn conversation where the first turn
+    called a tool and the second turn calls another, both assistant
+    responses carry ``id='call_0'`` -- clients that dedupe by id
+    (egg-mono is one) treat the second call as already-approved and
+    silently skip the approval dialog and the execution.
+
+    Fix: tool_call_id must be globally unique per call, not just
+    per request.  A UUID-prefixed id guarantees that.
+    """
+    seen_ids: set[str] = set()
+    for turn in range(3):
+        state = _make_state()
+        events = _feed(
+            state,
+            '<tool_call>{"name": "f", "arguments": {}}</tool_call>',
+            chunk=len('<tool_call>{"name": "f", "arguments": {}}</tool_call>'),
+        )
+        start_ev = next(e for e in events if e.kind == EventKind.TOOL_CALL_START)
+        commit_ev = next(e for e in events if e.kind == EventKind.TOOL_CALL_COMMIT)
+
+        # START and COMMIT for the same call must share an id.
+        assert start_ev.tool_call_id == commit_ev.tool_call_id, (
+            f"turn {turn}: START id {start_ev.tool_call_id!r} != "
+            f"COMMIT id {commit_ev.tool_call_id!r}"
+        )
+
+        # Id must not repeat across requests.
+        assert start_ev.tool_call_id not in seen_ids, (
+            f"turn {turn}: tool_call_id {start_ev.tool_call_id!r} was "
+            f"already emitted by a previous parser instance -- clients "
+            f"will dedupe by id and drop the second call"
+        )
+        seen_ids.add(start_ev.tool_call_id)
+
+
+def test_two_tool_calls_in_one_response_have_distinct_ids():
+    """Same-response multi-tool_call: each entry must have its own id."""
+    state = _make_state()
+    text = (
+        '<tool_call>{"name": "a", "arguments": {}}</tool_call>'
+        '<tool_call>{"name": "b", "arguments": {}}</tool_call>'
+    )
+    events = _feed(state, text, chunk=len(text))
+    commits = [e for e in events if e.kind == EventKind.TOOL_CALL_COMMIT]
+    assert len(commits) == 2
+    assert commits[0].tool_call_id != commits[1].tool_call_id, (
+        f"two distinct tool calls got the same id: "
+        f"{commits[0].tool_call_id!r}"
+    )
+
+
 def test_string_arguments_with_escapes_stream_correctly():
     """Escaped quotes inside a string-valued arguments field."""
     state = _make_state()

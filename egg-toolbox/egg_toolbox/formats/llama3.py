@@ -20,6 +20,7 @@ import ast
 import enum
 import json
 import re
+import uuid
 from typing import Any
 
 from ..types import SemanticEvent, EventKind, StopReason, Tool, FormatAnalysis
@@ -291,7 +292,7 @@ class Llama3ParserState(FormatParserState):
     def _commit_tool(self) -> list[SemanticEvent]:
         name, args = _parse_llama3_body(self._body_buffer, self._args_field)
         self._body_buffer = ""
-        tool_call_id = f"call_{self._tool_index}"
+        tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
         events = [
             SemanticEvent(kind=EventKind.TOOL_CALL_NAME, tool_index=self._tool_index, tool_name=name),
             SemanticEvent(kind=EventKind.TOOL_ARGS_DELTA, tool_index=self._tool_index, text=args),

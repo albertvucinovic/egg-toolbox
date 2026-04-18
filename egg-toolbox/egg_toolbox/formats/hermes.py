@@ -1,6 +1,7 @@
 import enum
 import json
 import re
+import uuid
 from typing import Any
 
 from ..types import SemanticEvent, EventKind, StopReason, Tool, FormatAnalysis
@@ -428,6 +429,13 @@ class HermesParserState(FormatParserState):
         # commit time, BEFORE emitting TOOL_CALL_COMMIT.
         self._current_name_emitted = False
         self._current_args_streamed = False
+        # Persist the tool_call_id generated at TOOL_CALL_START so
+        # COMMIT (and any catch-up events) reuse the same id -- the
+        # client uses this id to correlate the tool result message in
+        # the next turn.  Fresh UUID per call; never reused across
+        # parser instances so two turns in a conversation get distinct
+        # ids (egg-mono and similar clients dedupe by id).
+        self._current_tool_call_id: str = ""
 
     def feed_token(self, token_id: int, token_text: str) -> list[SemanticEvent]:
         events: list[SemanticEvent] = []
@@ -480,11 +488,11 @@ class HermesParserState(FormatParserState):
             )
             self._current_name_emitted = False
             self._current_args_streamed = False
-            tool_call_id = f"call_{self._tool_index}"
+            self._current_tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             events.append(SemanticEvent(
                 kind=EventKind.TOOL_CALL_START,
                 tool_index=self._tool_index,
-                tool_call_id=tool_call_id,
+                tool_call_id=self._current_tool_call_id,
             ))
             self._state = _HermesState.IN_TOOL_TAG
             return events
@@ -616,11 +624,10 @@ class HermesParserState(FormatParserState):
                 text=args,
             ))
 
-        tool_call_id = f"call_{self._tool_index}"
         events.append(SemanticEvent(
             kind=EventKind.TOOL_CALL_COMMIT,
             tool_index=self._tool_index,
-            tool_call_id=tool_call_id,
+            tool_call_id=self._current_tool_call_id,
             tool_name=name,
             tool_arguments=args,
         ))
@@ -663,11 +670,13 @@ class HermesParserState(FormatParserState):
                 self._extractor = _StreamingBodyExtractor(
                     self._analysis.name_field, self._analysis.args_field,
                 )
-                tool_call_id = f"call_{self._tool_index}"
+                self._current_name_emitted = False
+                self._current_args_streamed = False
+                self._current_tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
                 events.append(SemanticEvent(
                     kind=EventKind.TOOL_CALL_START,
                     tool_index=self._tool_index,
-                    tool_call_id=tool_call_id,
+                    tool_call_id=self._current_tool_call_id,
                 ))
                 self._state = _HermesState.IN_TOOL_TAG
             # else: still partial, wait for more data
@@ -697,11 +706,11 @@ class HermesParserState(FormatParserState):
             )
             self._current_name_emitted = False
             self._current_args_streamed = False
-            tool_call_id = f"call_{self._tool_index}"
+            self._current_tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             events.append(SemanticEvent(
                 kind=EventKind.TOOL_CALL_START,
                 tool_index=self._tool_index,
-                tool_call_id=tool_call_id,
+                tool_call_id=self._current_tool_call_id,
             ))
             self._state = _HermesState.IN_TOOL_TAG
             return events

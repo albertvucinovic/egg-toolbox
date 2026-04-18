@@ -59,10 +59,17 @@ async def _stream_response(
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
-    # Initial role chunk
+    # Initial role chunk.  OpenAI's streaming convention: the first
+    # delta carries the role and a NULL content field when the
+    # response body will be tool_calls only (content is filled in
+    # lazily by later deltas if text is emitted).  We match that:
+    # ``content`` is the JSON null literal, not an empty string.
+    # Strict clients (egg-mono, some OpenAI SDKs) treat "" as "content
+    # mode" and mis-classify subsequent tool_calls; null keeps the
+    # door open to either.
     chunk = _make_chunk(request_id, created, model_name, {
         "role": "assistant",
-        "content": "",
+        "content": None,
     })
     yield f"data: {json.dumps(chunk)}\n\n"
 

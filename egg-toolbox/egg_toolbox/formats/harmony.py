@@ -38,6 +38,7 @@ from __future__ import annotations
 import enum
 import json
 import re
+import uuid
 from typing import Any
 
 from ..types import SemanticEvent, EventKind, StopReason, Tool, FormatAnalysis
@@ -235,7 +236,7 @@ class HarmonyParserState(FormatParserState):
         # will be args and we commit on <|call|>.
         if self._gptoss_channel == "commentary" and self._gptoss_tool_name:
             name = self._gptoss_tool_name.split(".")[-1]
-            tool_call_id = f"call_{self._tool_index}"
+            tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             events.append(SemanticEvent(
                 kind=EventKind.TOOL_CALL_START,
                 tool_index=self._tool_index,
@@ -290,7 +291,7 @@ class HarmonyParserState(FormatParserState):
 
     def _emit_tool_call(self, name: str, args: str) -> list[SemanticEvent]:
         """Emit a fresh tool call (START + NAME + ARGS_DELTA + COMMIT)."""
-        tool_call_id = f"call_{self._tool_index}"
+        tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
         events = [
             SemanticEvent(
                 kind=EventKind.TOOL_CALL_START,
@@ -313,7 +314,7 @@ class HarmonyParserState(FormatParserState):
     def _finalise_started_tool_call(self, args: str) -> list[SemanticEvent]:
         """Close a tool call whose START+NAME was emitted eagerly
         (dialect 2 path).  Emits only the trailing ARGS_DELTA + COMMIT."""
-        tool_call_id = f"call_{self._tool_index}"
+        tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
         name_field = ""  # ignored here; COMMIT just needs consistent id
         events = [
             SemanticEvent(kind=EventKind.TOOL_ARGS_DELTA, tool_index=self._tool_index, text=args),
