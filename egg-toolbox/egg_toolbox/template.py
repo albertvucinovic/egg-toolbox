@@ -168,7 +168,13 @@ class ChatTemplate:
                     "type": tc.type,
                     "function": {
                         "name": tc.function.name,
-                        "arguments": tc.function.arguments,
+                        # Parse the OpenAI-style JSON-string arguments into
+                        # a dict so templates (which invariably expect an
+                        # object here) serialise it as real JSON rather
+                        # than a JSON-encoded string.  If parsing fails
+                        # fall back to the original string so no info is
+                        # lost.
+                        "arguments": _parse_tool_arguments(tc.function.arguments),
                     },
                 }
                 for tc in msg.tool_calls
@@ -222,6 +228,20 @@ class ChatTemplate:
     @staticmethod
     def _tojson(value: Any, indent: int | None = None) -> str:
         return json.dumps(value, indent=indent, ensure_ascii=False)
+
+
+def _parse_tool_arguments(arguments: Any) -> Any:
+    """Convert OpenAI-style JSON-string tool arguments into the dict
+    shape that all chat templates expect.  Non-string inputs pass
+    through untouched so this is safe to call on any source shape.
+    """
+    if not isinstance(arguments, str):
+        return arguments
+    try:
+        parsed = json.loads(arguments)
+    except (ValueError, TypeError):
+        return arguments
+    return parsed
 
 
 # --- GGUF parsing helpers ---
