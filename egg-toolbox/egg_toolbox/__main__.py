@@ -25,6 +25,12 @@ def main():
                              "forward pass, so native 128K-context models will "
                              "OOM even a 24 GB GPU.  4096-16384 is usually "
                              "plenty for tool-call testing.")
+    parser.add_argument("--keep-packed", action="store_true",
+                        help="(tinygrad backend) Skip the .contiguous()+realize() "
+                             "on weights at load.  tinygrad's scheduler fuses "
+                             "dequantize into each matmul so packed GGUF weights "
+                             "stay on device -- ~4x lower weight memory on Q4_0 "
+                             "at the cost of slower generation.")
     parser.add_argument("--gpu-layers", type=int, default=-1,
                         help="GPU layers for llamacpp backend (default: -1 = all)")
     parser.add_argument("--tensor-parallel", type=int, default=1,
@@ -37,6 +43,8 @@ def main():
     load_kwargs: dict = {}
     if args.context_length is not None:
         load_kwargs["max_context"] = args.context_length
+    if args.keep_packed:
+        load_kwargs["keep_packed"] = True
     backend.load_model(args.model, **load_kwargs)
 
     # Create orchestrator

@@ -97,7 +97,12 @@ class TinygradBackend(StepBackend):
         return self._model_name_str
 
 
-def _from_gguf_with_qkv_bias(gguf, max_context: int | None = None, realize: bool = True):
+def _from_gguf_with_qkv_bias(
+    gguf,
+    max_context: int | None = None,
+    realize: bool = True,
+    keep_packed: bool = False,
+):
     """Load a GGUF into a tinygrad Transformer, preserving attn_{q,k,v}.bias.
 
     tinygrad's Transformer.from_gguf constructs bias-free Linear modules for
@@ -105,6 +110,20 @@ def _from_gguf_with_qkv_bias(gguf, max_context: int | None = None, realize: bool
     some others) are silently dropped and generation produces garbage.
     This loader mirrors tinygrad's from_gguf but attaches zero-initialised
     bias tensors before load_state_dict so those weights land in the model.
+
+    Memory/speed tradeoff via ``keep_packed``:
+
+    - ``keep_packed=False`` (default, matches upstream): call ``.contiguous()
+      + realize()`` on every parameter.  Weights are dequantized to fp16
+      dense tensors -> fast matmul, but an 8B Q4_0 GGUF occupies ~16 GB
+      of VRAM regardless of the on-disk quantization.
+    - ``keep_packed=True``: skip both calls.  Parameters remain lazy,
+      referring to the packed GGUF-layout tensors on-device.  tinygrad's
+      scheduler fuses the dequantize ops into each matmul kernel, so
+      the packed weights stay put.  ~4x lower weight-memory on Q4_0;
+      generation is slower because dequantize runs per-matmul.  The
+      upstream loader has a comment "without this contiguous, it unpacks
+      the weights from the model every time" explaining exactly this.
     """
     from tinygrad import Tensor, nn
     from tinygrad.apps.llm import Transformer
@@ -171,6 +190,12 @@ def _from_gguf_with_qkv_bias(gguf, max_context: int | None = None, realize: bool
                     getattr(block, proj).bias = Tensor.zeros(out_features, dtype=dtype)
 
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)
+    if keep_packed:
+        # Memory-efficient path: do NOT materialize the dequantized fp16
+        # weights.  tinygrad's scheduler will fuse dequant ops into each
+        # matmul, so packed GGUF weights stay on device.  Generation is
+        # slower but weight memory drops to roughly the on-disk size.
+        return model, kv
     for s in (params := nn.state.get_parameters(model)):
         s.replace(s.contiguous())
     if realize:
