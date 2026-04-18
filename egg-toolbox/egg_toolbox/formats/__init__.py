@@ -3,6 +3,7 @@ from __future__ import annotations
 from ..types import FormatAnalysis, ToolFormatMode
 from .base import FormatHandler
 from .deepseek import DeepSeekHandler
+from .generic import GenericHandler
 from .hermes import HermesHandler
 from .llama3 import Llama3Handler
 from .mistral import MistralHandler
@@ -18,7 +19,9 @@ def get_handler_for_format(analysis: FormatAnalysis) -> FormatHandler:
         return MistralHandler(analysis)
     if analysis.tool_mode == ToolFormatMode.DEEPSEEK:
         return DeepSeekHandler(analysis)
-    # Phase 2 remaining: functionary, command_r, harmony, generic
+    if analysis.tool_mode == ToolFormatMode.GENERIC_JSON:
+        return GenericHandler(analysis)
+    # Phase 2 remaining: functionary, command_r, harmony
     # Until those land, fall back to Hermes for any format that has tools.
     if analysis.tool_mode != ToolFormatMode.NONE:
         return HermesHandler(analysis)
