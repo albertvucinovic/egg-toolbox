@@ -34,7 +34,7 @@ Universal tool calling middleware for local LLM backends. Sits between inference
 
 ### Backend Abstraction (`omnitool/backends/`)
 - `base.py`: `Tokenizer` ABC, `StepBackend` ABC (token-by-token), `ConstraintBackend` ABC (text chunks)
-- `tinygrad.py`: `TinygradBackend` wrapping `Transformer.generate()` (Phase 1)
+- `tinygrad.py`: `TinygradBackend` using `tinygrad.apps.llm.Transformer.from_gguf()` + `SimpleTokenizer.from_gguf_kv()` (Phase 1)
 - Planned (Phase 3): llamacpp, vllm, sglang
 
 ### Orchestrator (`omnitool/orchestrator.py`)
@@ -71,8 +71,18 @@ API Request -> parse_messages/parse_tools/parse_sampling
 - Backend extras: tinygrad | vllm | sglang | llama-cpp-python
 - Dev: pytest, pytest-asyncio, httpx
 
+## Testing (`tests/`)
+- `conftest.py`: `ScriptedBackend` (deterministic char-level token generator), `CharTokenizer`, `make_client` fixture, `gguf_model_path` fixture (downloads Qwen2.5-0.5B Q4_0 GGUF)
+- `test_e2e.py`: 12 tests total
+  - `TestContentOnly`: streaming + non-streaming content (scripted)
+  - `TestToolCalling`: streaming + non-streaming tool calls (scripted)
+  - `TestSSEFormat`: SSE line format, chunk JSON structure, [DONE] sentinel (scripted)
+  - `TestAuxEndpoints`: /health, /v1/models (scripted)
+  - `TestRealModel`: content generation, streaming format, tool request no-crash (real tinygrad + GGUF)
+- Note: `CACHELEVEL=0` set in conftest to avoid tinygrad SQLite thread issues with TestClient
+
 ## Implementation Status
-- **Phase 1 (COMPLETE)**: types, template, detector (stub), hermes format, parser, backends/base, backends/tinygrad, orchestrator, api/openai, api/middleware, __main__
+- **Phase 1 (COMPLETE)**: types, template, detector (stub), hermes format, parser, backends/base, backends/tinygrad, orchestrator, api/openai, api/middleware, __main__, E2E tests
 - **Phase 2 (TODO)**: Full detector, all format handlers, Anthropic API, grammar generation
 - **Phase 3 (TODO)**: llama-cpp-python, vLLM, SGLang backends
 - **Phase 4 (TODO)**: Error recovery, timeouts, parallel tools, token tracking, grammar-guided speculative decoding

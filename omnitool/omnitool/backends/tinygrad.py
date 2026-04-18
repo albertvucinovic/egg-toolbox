@@ -53,42 +53,29 @@ class TinygradBackend(StepBackend):
         self._chat_template: str = ""
 
     def load_model(self, model_path: str, **kwargs: Any) -> None:
-        from tinygrad.nn.llm import Transformer, SimpleTokenizer
+        from tinygrad import Tensor
+        from tinygrad.apps.llm import Transformer, SimpleTokenizer
 
         model_path_obj = Path(model_path)
         self._model_name_str = model_path_obj.stem
 
-        # Build model from GGUF
-        self._model = Transformer.build(model_path, **kwargs)
+        # Build model from GGUF -- returns (model, kv_metadata)
+        self._model, kv = Transformer.from_gguf(Tensor(model_path_obj), **kwargs)
 
         # Extract chat template from GGUF metadata
         from ..template import ChatTemplate
         ct = ChatTemplate.from_gguf(model_path)
         self._chat_template = ct.source
 
-        # Create tokenizer wrapper
-        tokenizer = SimpleTokenizer(model_path)
-        eos_id = ct.eos_token  # We need the ID, not the token string
-        # Get IDs from the GGUF metadata directly
-        import struct
-        bos_id = None
-        eos_id_int = 0
-        with open(model_path, "rb") as f:
-            magic = f.read(4)
-            version = struct.unpack("<I", f.read(4))[0]
-            _tensor_count = struct.unpack("<Q", f.read(8))[0]
-            kv_count = struct.unpack("<Q", f.read(8))[0]
-            from ..template import _read_gguf_string, _read_gguf_value
-            for _ in range(kv_count):
-                key = _read_gguf_string(f, version)
-                value_type = struct.unpack("<I", f.read(4))[0]
-                value = _read_gguf_value(f, value_type, version)
-                if key == "tokenizer.ggml.bos_token_id":
-                    bos_id = value
-                elif key == "tokenizer.ggml.eos_token_id":
-                    eos_id_int = value
+        # Create tokenizer from GGUF kv metadata
+        tokenizer = SimpleTokenizer.from_gguf_kv(kv)
 
-        self._tokenizer = TinygradTokenizer(tokenizer, eos_id=eos_id_int, bos_id=bos_id)
+        # Get token IDs from kv metadata
+        eos_id = int(kv.get("tokenizer.ggml.eos_token_id", 0))
+        bos_id_raw = kv.get("tokenizer.ggml.bos_token_id")
+        bos_id = int(bos_id_raw) if bos_id_raw is not None else None
+
+        self._tokenizer = TinygradTokenizer(tokenizer, eos_id=eos_id, bos_id=bos_id)
 
     def tokenizer(self) -> Tokenizer:
         assert self._tokenizer is not None, "Model not loaded"
@@ -100,10 +87,7 @@ class TinygradBackend(StepBackend):
     def generate_tokens(self, request: CompiledRequest) -> Iterator[int]:
         """Wrap Transformer.generate() which already yields token IDs."""
         assert self._model is not None, "Model not loaded"
-        for token_id in self._model.generate(
-            list(request.prompt_tokens),
-            temperature=request.sampling.temperature,
-        ):
+        for token_id in self._model.generate(list(request.prompt_tokens)):
             yield token_id
 
     def model_name(self) -> str:

@@ -254,29 +254,30 @@ class HermesParserState(FormatParserState):
 
     def finish(self) -> list[SemanticEvent]:
         events: list[SemanticEvent] = []
-        # Flush any remaining buffer
-        if self._buffer:
-            if self._state == _HermesState.IN_TOOL_TAG:
-                self._json_buffer += self._buffer
-                self._buffer = ""
-                # Attempt to commit incomplete tool call
-                try:
-                    parsed = json.loads(self._json_buffer)
-                    name = parsed.get(self._analysis.name_field, parsed.get("name", ""))
-                    args_raw = parsed.get(self._analysis.args_field, parsed.get("arguments", {}))
-                    args = json.dumps(args_raw) if not isinstance(args_raw, str) else args_raw
-                    events.append(SemanticEvent(kind=EventKind.TOOL_CALL_NAME, tool_index=self._tool_index, tool_name=name))
-                    events.append(SemanticEvent(
-                        kind=EventKind.TOOL_CALL_COMMIT,
-                        tool_index=self._tool_index,
-                        tool_call_id=f"call_{self._tool_index}",
-                        tool_name=name,
-                        tool_arguments=args,
-                    ))
-                    self._tool_index += 1
-                except json.JSONDecodeError:
-                    pass
-            elif self._state in (_HermesState.CONTENT, _HermesState.AFTER_TOOL_CALL):
+
+        # Commit any in-progress tool call (buffer may be empty if the
+        # orchestrator's stop-string matcher already consumed </tool_call>).
+        if self._state == _HermesState.IN_TOOL_TAG:
+            self._json_buffer += self._buffer
+            self._buffer = ""
+            try:
+                parsed = json.loads(self._json_buffer)
+                name = parsed.get(self._analysis.name_field, parsed.get("name", ""))
+                args_raw = parsed.get(self._analysis.args_field, parsed.get("arguments", {}))
+                args = json.dumps(args_raw) if not isinstance(args_raw, str) else args_raw
+                events.append(SemanticEvent(kind=EventKind.TOOL_CALL_NAME, tool_index=self._tool_index, tool_name=name))
+                events.append(SemanticEvent(
+                    kind=EventKind.TOOL_CALL_COMMIT,
+                    tool_index=self._tool_index,
+                    tool_call_id=f"call_{self._tool_index}",
+                    tool_name=name,
+                    tool_arguments=args,
+                ))
+                self._tool_index += 1
+            except json.JSONDecodeError:
+                pass
+        elif self._buffer:
+            if self._state in (_HermesState.CONTENT, _HermesState.AFTER_TOOL_CALL):
                 if self._buffer.strip():
                     events.append(SemanticEvent(kind=EventKind.CONTENT_DELTA, text=self._buffer))
                 self._buffer = ""
