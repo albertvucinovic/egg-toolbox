@@ -9,6 +9,7 @@ Universal tool calling middleware for local LLM backends. Sits between inference
 - **Frozen dataclasses**: `Tool`, `ToolFunction`, `ToolParameter`, `ChatMessage`, `ContentPart`, `ToolCall`, `ToolCallFunction`, `SemanticEvent`, `SamplingParams`, `CompiledRequest`, `FormatAnalysis`
 - **Enums**: `EventKind`, `StopReason`, `ToolFormatMode`, `ReasoningMode`
 - `SemanticEvent` is the universal IR -- both OpenAI and Anthropic APIs are lossless projections from it
+- `SemanticEvent.prompt_tokens` / `completion_tokens`: populated on DONE events by orchestrator
 
 ### Template Engine (`omnitool/template.py`)
 - `ChatTemplate` class: loads Jinja2 chat templates from GGUF metadata or HF tokenizer_config.json
@@ -45,7 +46,15 @@ Universal tool calling middleware for local LLM backends. Sits between inference
 
 ### API Layer (`omnitool/api/`)
 - `openai.py`: `/v1/chat/completions` -- streaming + non-streaming, SemanticEvent to OpenAI SSE projection
-- `middleware.py`: Starlette app factory with CORS, `/v1/models`, `/health`
+  - Accepts pre-parsed body dict (JSON parsing/validation done in middleware)
+  - `tool_choice`: `"auto"` (default), `"none"` (suppresses tools), `"required"`/dict (treated as auto for MVP)
+  - `stream_options`: `{include_usage: true}` emits usage-only chunk before `[DONE]`
+  - `system_fingerprint`: `"omnitool-v0"` in all responses
+  - Real token usage from orchestrator DONE events
+- `middleware.py`: Starlette app factory with CORS, `/v1/models`, `/health`, error handling
+  - JSON parse errors -> 400 with `invalid_request_error`
+  - Missing/invalid `messages` -> 400
+  - Orchestrator exceptions -> 500 with `server_error` (no stack traces)
 - Planned (Phase 2): `anthropic.py` for `/v1/messages`
 
 ### CLI (`omnitool/__main__.py`)
@@ -72,12 +81,16 @@ API Request -> parse_messages/parse_tools/parse_sampling
 - Dev: pytest, pytest-asyncio, httpx
 
 ## Testing (`tests/`)
-- `conftest.py`: `ScriptedBackend` (deterministic char-level token generator), `CharTokenizer`, `make_client` fixture, `gguf_model_path` fixture (downloads Qwen2.5-0.5B Q4_0 GGUF)
-- `test_e2e.py`: 12 tests total
+- `conftest.py`: `ScriptedBackend`, `ErrorBackend`, `CharTokenizer`, `make_client`/`make_client_raw` fixtures, `gguf_model_path` fixture
+- `test_e2e.py`: 23 tests total
   - `TestContentOnly`: streaming + non-streaming content (scripted)
   - `TestToolCalling`: streaming + non-streaming tool calls (scripted)
   - `TestSSEFormat`: SSE line format, chunk JSON structure, [DONE] sentinel (scripted)
-  - `TestAuxEndpoints`: /health, /v1/models (scripted)
+  - `TestAuxEndpoints`: /health, /v1/models with created>0 and owned_by=omnitool (scripted)
+  - `TestErrorHandling`: invalid JSON, missing messages, empty messages, orchestrator error (scripted)
+  - `TestTokenCounts`: non-streaming usage, streaming include_usage, streaming no usage default (scripted)
+  - `TestToolChoice`: tool_choice=none suppresses tools, tool_choice=auto allows them (scripted)
+  - `TestSystemFingerprint`: system_fingerprint in streaming + non-streaming (scripted)
   - `TestRealModel`: content generation, streaming format, tool request no-crash (real tinygrad + GGUF)
 - Note: `CACHELEVEL=0` set in conftest to avoid tinygrad SQLite thread issues with TestClient
 
@@ -85,4 +98,5 @@ API Request -> parse_messages/parse_tools/parse_sampling
 - **Phase 1 (COMPLETE)**: types, template, detector (stub), hermes format, parser, backends/base, backends/tinygrad, orchestrator, api/openai, api/middleware, __main__, E2E tests
 - **Phase 2 (TODO)**: Full detector, all format handlers, Anthropic API, grammar generation
 - **Phase 3 (TODO)**: llama-cpp-python, vLLM, SGLang backends
-- **Phase 4 (TODO)**: Error recovery, timeouts, parallel tools, token tracking, grammar-guided speculative decoding
+- **Phase 4 (TODO)**: Error recovery, timeouts, parallel tools, grammar-guided speculative decoding
+- **Production API (COMPLETE)**: Token tracking, error handling, tool_choice, stream_options, system_fingerprint

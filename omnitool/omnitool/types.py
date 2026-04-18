@@ -138,6 +138,8 @@ class SemanticEvent:
     error_message: str | None = None            # error
     raw_token: str | None = None                # the literal decoded token (for debugging)
     token_id: int | None = None                 # the token ID (for debugging)
+    prompt_tokens: int | None = None            # token count (DONE events only)
+    completion_tokens: int | None = None        # token count (DONE events only)
 
 
 # --- Compiled Request (middleware output to backend) ---

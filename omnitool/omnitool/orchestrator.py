@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import AsyncIterator
 
 from .types import (
@@ -192,7 +193,14 @@ class Orchestrator:
                 yield event
 
         # Finalize
+        num_prompt = len(request.prompt_tokens)
         for event in parser.finish():
+            if event.kind == EventKind.DONE:
+                event = dataclasses.replace(
+                    event,
+                    prompt_tokens=num_prompt,
+                    completion_tokens=token_count,
+                )
             yield event
 
     async def _run_constraint_backend(
@@ -203,10 +211,20 @@ class Orchestrator:
         """Execute generation on a constraint backend (vLLM, SGLang)."""
         assert isinstance(self._backend, ConstraintBackend)
 
+        accumulated_text: list[str] = []
         async for text_chunk in self._backend.generate_stream(request):
+            accumulated_text.append(text_chunk)
             events = parser.feed_text(text_chunk)
             for event in events:
                 yield event
 
+        num_prompt = len(request.prompt_tokens)
+        completion_tokens = len(self._tokenizer.encode("".join(accumulated_text)))
         for event in parser.finish():
+            if event.kind == EventKind.DONE:
+                event = dataclasses.replace(
+                    event,
+                    prompt_tokens=num_prompt,
+                    completion_tokens=completion_tokens,
+                )
             yield event

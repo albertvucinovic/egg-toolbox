@@ -94,6 +94,29 @@ class ScriptedBackend(StepBackend):
         return "scripted-test"
 
 
+class ErrorBackend(StepBackend):
+    """Backend that raises an exception during generation."""
+
+    def __init__(self, template: str = HERMES_TEMPLATE):
+        self._template = template
+        self._tok = CharTokenizer()
+
+    def load_model(self, model_path: str, **kwargs: Any) -> None:
+        pass
+
+    def tokenizer(self) -> Tokenizer:
+        return self._tok
+
+    def chat_template_source(self) -> str:
+        return self._template
+
+    def generate_tokens(self, request: CompiledRequest) -> Iterator[int]:
+        raise RuntimeError("Simulated backend failure")
+
+    def model_name(self) -> str:
+        return "error-test"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -103,6 +126,19 @@ def make_client():
     """Factory fixture: returns a TestClient backed by ScriptedBackend(output)."""
     def _factory(output: str) -> TestClient:
         backend = ScriptedBackend(output)
+        orch = Orchestrator(backend)
+        return TestClient(create_app(orch))
+    return _factory
+
+
+@pytest.fixture
+def make_client_raw():
+    """Factory fixture for testing error scenarios."""
+    def _factory(raise_error: bool = False) -> TestClient:
+        if raise_error:
+            backend = ErrorBackend()
+        else:
+            backend = ScriptedBackend("")
         orch = Orchestrator(backend)
         return TestClient(create_app(orch))
     return _factory

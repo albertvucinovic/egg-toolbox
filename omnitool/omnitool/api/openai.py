@@ -5,7 +5,6 @@ import time
 import uuid
 from typing import Any
 
-from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 
 from ..types import (
@@ -16,19 +15,30 @@ from ..types import (
 from ..orchestrator import Orchestrator
 
 
-async def chat_completions(request: Request, orchestrator: Orchestrator) -> StreamingResponse | JSONResponse:
-    """Handle POST /v1/chat/completions"""
-    body = await request.json()
+async def chat_completions(body: dict, orchestrator: Orchestrator) -> StreamingResponse | JSONResponse:
+    """Handle POST /v1/chat/completions.
 
+    Accepts a pre-parsed body dict (JSON parsing and validation done in middleware).
+    """
     messages = _parse_messages(body["messages"])
     tools = _parse_tools(body.get("tools")) if body.get("tools") else None
     sampling = _parse_sampling(body)
     stream = body.get("stream", False)
     model_name = body.get("model", orchestrator._backend.model_name())
 
+    # Handle tool_choice
+    tool_choice = body.get("tool_choice", "auto")
+    if tool_choice == "none":
+        tools = None
+
+    # Parse stream_options
+    stream_options = body.get("stream_options") or {}
+    include_usage = stream_options.get("include_usage", False) if stream else False
+
     if stream:
         return StreamingResponse(
-            _stream_response(orchestrator, messages, tools, sampling, model_name),
+            _stream_response(orchestrator, messages, tools, sampling, model_name,
+                             include_usage=include_usage),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -42,6 +52,8 @@ async def _stream_response(
     tools: list[Tool] | None,
     sampling: SamplingParams,
     model_name: str,
+    *,
+    include_usage: bool = False,
 ):
     """Generate SSE events in OpenAI streaming format."""
     request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -54,11 +66,33 @@ async def _stream_response(
     })
     yield f"data: {json.dumps(chunk)}\n\n"
 
-    # Stream semantic events
+    # Stream semantic events; capture the DONE event for usage
+    done_event: SemanticEvent | None = None
     async for event in orchestrator.chat_completion(messages, tools, sampling, stream=True):
+        if event.kind == EventKind.DONE:
+            done_event = event
         chunks = _event_to_openai_chunks(event, request_id, created, model_name)
         for c in chunks:
             yield f"data: {json.dumps(c)}\n\n"
+
+    # Emit usage chunk if requested
+    if include_usage and done_event is not None:
+        prompt_tokens = done_event.prompt_tokens or 0
+        completion_tokens = done_event.completion_tokens or 0
+        usage_chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "system_fingerprint": "omnitool-v0",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+        yield f"data: {json.dumps(usage_chunk)}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -78,6 +112,8 @@ async def _non_stream_response(
     reasoning_parts: list[str] = []
     tool_calls_list: list[dict] = []
     finish_reason = "stop"
+    prompt_tokens = 0
+    completion_tokens = 0
 
     async for event in orchestrator.chat_completion(messages, tools, sampling, stream=False):
         if event.kind == EventKind.CONTENT_DELTA and event.text:
@@ -100,6 +136,8 @@ async def _non_stream_response(
                 StopReason.TOOL_CALLS: "tool_calls",
                 StopReason.ERROR: "stop",
             }.get(event.stop_reason, "stop")
+            prompt_tokens = event.prompt_tokens or 0
+            completion_tokens = event.completion_tokens or 0
 
     message: dict[str, Any] = {
         "role": "assistant",
@@ -115,15 +153,16 @@ async def _non_stream_response(
         "object": "chat.completion",
         "created": created,
         "model": model_name,
+        "system_fingerprint": "omnitool-v0",
         "choices": [{
             "index": 0,
             "message": message,
             "finish_reason": finish_reason,
         }],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     })
 
@@ -199,6 +238,7 @@ def _make_chunk(
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
+        "system_fingerprint": "omnitool-v0",
         "choices": [{
             "index": 0,
             "delta": delta,

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from functools import partial
-from typing import Any
+import time
+import traceback
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -15,11 +15,60 @@ from .openai import chat_completions
 from ..orchestrator import Orchestrator
 
 
+def _error_response(status: int, message: str, error_type: str, code: str | None = None) -> JSONResponse:
+    """Return an OpenAI-format error response."""
+    error: dict = {
+        "message": message,
+        "type": error_type,
+    }
+    if code is not None:
+        error["code"] = code
+    return JSONResponse({"error": error}, status_code=status)
+
+
 def create_app(orchestrator: Orchestrator) -> Starlette:
     """Create the ASGI application with all routes."""
 
-    async def handle_chat_completions(request: Request) -> Any:
-        return await chat_completions(request, orchestrator)
+    async def handle_chat_completions(request: Request) -> JSONResponse:
+        # Parse JSON body
+        try:
+            raw = await request.body()
+            body = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as e:
+            return _error_response(
+                400,
+                f"Invalid JSON in request body: {e}",
+                "invalid_request_error",
+                "invalid_json",
+            )
+
+        # Validate messages field
+        if "messages" not in body:
+            return _error_response(
+                400,
+                "Missing required field: 'messages'",
+                "invalid_request_error",
+                "missing_field",
+            )
+        if not isinstance(body["messages"], list) or len(body["messages"]) == 0:
+            return _error_response(
+                400,
+                "'messages' must be a non-empty array",
+                "invalid_request_error",
+                "invalid_field",
+            )
+
+        # Dispatch to handler
+        try:
+            return await chat_completions(body, orchestrator)
+        except Exception:
+            traceback.print_exc()
+            return _error_response(
+                500,
+                "Internal server error",
+                "server_error",
+                "internal_error",
+            )
 
     async def list_models(request: Request) -> JSONResponse:
         model_name = orchestrator._backend.model_name()
@@ -28,8 +77,8 @@ def create_app(orchestrator: Orchestrator) -> Starlette:
             "data": [{
                 "id": model_name,
                 "object": "model",
-                "created": 0,
-                "owned_by": "local",
+                "created": int(time.time()),
+                "owned_by": "omnitool",
             }],
         })
 

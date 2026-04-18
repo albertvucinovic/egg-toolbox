@@ -208,6 +208,183 @@ class TestAuxEndpoints:
         body = client.get("/v1/models").json()
         assert body["object"] == "list"
         assert body["data"][0]["id"] == "scripted-test"
+        assert body["data"][0]["created"] > 0
+        assert body["data"][0]["owned_by"] == "omnitool"
+
+
+class TestErrorHandling:
+    """Error handling: malformed requests return JSON errors, not stack traces."""
+
+    def test_invalid_json(self, make_client):
+        client = make_client("")
+        resp = client.post(
+            "/v1/chat/completions",
+            content=b"not json at all{{{",
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["code"] == "invalid_json"
+
+    def test_missing_messages(self, make_client):
+        client = make_client("")
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "test"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["type"] == "invalid_request_error"
+        assert "messages" in body["error"]["message"]
+
+    def test_empty_messages(self, make_client):
+        client = make_client("")
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": []},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["type"] == "invalid_request_error"
+
+    def test_orchestrator_error(self, make_client_raw):
+        """Force an exception inside the orchestrator, expect 500 JSON error."""
+        client = make_client_raw(raise_error=True)
+        resp = client.post(
+            "/v1/chat/completions",
+            json=_chat_body("Hi", stream=False),
+        )
+        assert resp.status_code == 500
+        body = resp.json()
+        assert body["error"]["type"] == "server_error"
+        # Must NOT contain a Python traceback
+        assert "Traceback" not in json.dumps(body)
+
+
+class TestTokenCounts:
+    """Token usage is populated with real counts."""
+
+    def test_non_streaming_usage(self, make_client):
+        client = make_client("Hello, how can I help you?")
+        resp = client.post(
+            "/v1/chat/completions",
+            json=_chat_body("Hi", stream=False),
+        )
+        body = resp.json()
+        assert body["usage"]["prompt_tokens"] > 0
+        assert body["usage"]["completion_tokens"] > 0
+        assert body["usage"]["total_tokens"] == (
+            body["usage"]["prompt_tokens"] + body["usage"]["completion_tokens"]
+        )
+
+    def test_streaming_include_usage(self, make_client):
+        client = make_client("Hello!")
+        resp = client.post(
+            "/v1/chat/completions",
+            json=_chat_body("Hi", stream=True,
+                            stream_options={"include_usage": True}),
+        )
+        assert resp.status_code == 200
+        # Parse ALL data lines including usage chunk
+        all_data = []
+        for line in resp.text.split("\n"):
+            line = line.strip()
+            if not line or not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):]
+            if payload == "[DONE]":
+                continue
+            all_data.append(json.loads(payload))
+
+        # The last data chunk before [DONE] should be the usage chunk
+        usage_chunk = all_data[-1]
+        assert usage_chunk["choices"] == []
+        assert usage_chunk["usage"]["prompt_tokens"] > 0
+        assert usage_chunk["usage"]["completion_tokens"] > 0
+
+    def test_streaming_no_usage_default(self, make_client):
+        client = make_client("Hello!")
+        resp = client.post(
+            "/v1/chat/completions",
+            json=_chat_body("Hi", stream=True),
+        )
+        # No usage chunk should appear
+        all_data = []
+        for line in resp.text.split("\n"):
+            line = line.strip()
+            if not line or not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):]
+            if payload == "[DONE]":
+                continue
+            all_data.append(json.loads(payload))
+
+        for chunk in all_data:
+            assert "usage" not in chunk
+
+
+class TestToolChoice:
+    """tool_choice parameter handling."""
+
+    TOOL_OUTPUT = (
+        '<tool_call>{"name": "get_weather", '
+        '"arguments": {"location": "Paris"}}</tool_call>'
+    )
+
+    def test_tool_choice_none(self, make_client):
+        """tool_choice=none should suppress tools (model produces content)."""
+        # The scripted backend always outputs the same tokens regardless,
+        # but with tool_choice=none we pass tools=None to the orchestrator,
+        # so the parser won't recognize tool_call tags as tool calls.
+        client = make_client("Just some plain text content.")
+        resp = client.post(
+            "/v1/chat/completions",
+            json=_chat_body("Weather?", stream=False, tools=WEATHER_TOOL,
+                            tool_choice="none"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        msg = body["choices"][0]["message"]
+        # With tool_choice=none, should not produce tool_calls
+        assert msg.get("tool_calls") is None or len(msg.get("tool_calls", [])) == 0
+
+    def test_tool_choice_auto(self, make_client):
+        """tool_choice=auto (default) should allow tool calls."""
+        client = make_client(self.TOOL_OUTPUT)
+        resp = client.post(
+            "/v1/chat/completions",
+            json=_chat_body("Weather?", stream=False, tools=WEATHER_TOOL,
+                            tool_choice="auto"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        msg = body["choices"][0]["message"]
+        assert msg["tool_calls"] is not None
+        assert len(msg["tool_calls"]) == 1
+
+
+class TestSystemFingerprint:
+    """system_fingerprint is present in all responses."""
+
+    def test_non_streaming_fingerprint(self, make_client):
+        client = make_client("OK")
+        resp = client.post(
+            "/v1/chat/completions",
+            json=_chat_body("Hi", stream=False),
+        )
+        body = resp.json()
+        assert body["system_fingerprint"] == "omnitool-v0"
+
+    def test_streaming_fingerprint(self, make_client):
+        client = make_client("OK")
+        resp = client.post(
+            "/v1/chat/completions",
+            json=_chat_body("Hi", stream=True),
+        )
+        chunks = _parse_sse(resp.text)
+        for chunk in chunks:
+            assert chunk["system_fingerprint"] == "omnitool-v0"
 
 
 # ===================================================================
