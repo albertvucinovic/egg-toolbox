@@ -19,6 +19,12 @@ def main():
                         help="Default sampling temperature (default: 0.0)")
     parser.add_argument("--max-tokens", type=int, default=None,
                         help="Default max tokens")
+    parser.add_argument("--context-length", type=int, default=None,
+                        help="Cap the model's context window at load time. "
+                             "tinygrad preallocates the full KV cache at first "
+                             "forward pass, so native 128K-context models will "
+                             "OOM even a 24 GB GPU.  4096-16384 is usually "
+                             "plenty for tool-call testing.")
     parser.add_argument("--gpu-layers", type=int, default=-1,
                         help="GPU layers for llamacpp backend (default: -1 = all)")
     parser.add_argument("--tensor-parallel", type=int, default=1,
@@ -28,7 +34,10 @@ def main():
 
     # Load backend
     backend = _create_backend(args)
-    backend.load_model(args.model)
+    load_kwargs: dict = {}
+    if args.context_length is not None:
+        load_kwargs["max_context"] = args.context_length
+    backend.load_model(args.model, **load_kwargs)
 
     # Create orchestrator
     from .orchestrator import Orchestrator
