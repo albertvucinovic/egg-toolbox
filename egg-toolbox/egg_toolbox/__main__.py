@@ -26,11 +26,16 @@ def main():
                              "OOM even a 24 GB GPU.  4096-16384 is usually "
                              "plenty for tool-call testing.")
     parser.add_argument("--keep-packed", action="store_true",
-                        help="(tinygrad backend) Skip the .contiguous()+realize() "
-                             "on weights at load.  tinygrad's scheduler fuses "
-                             "dequantize into each matmul so packed GGUF weights "
-                             "stay on device -- ~4x lower weight memory on Q4_0 "
-                             "at the cost of slower generation.")
+                        help="(tinygrad backend) Skip .contiguous()+realize() on "
+                             "weights at load so tinygrad's scheduler fuses "
+                             "dequantize into each matmul and the packed GGUF "
+                             "stays on device.  Weight memory drops roughly to "
+                             "on-disk size (~4.5 GB for 8B-Q4_0 vs ~16 GB for "
+                             "fp16 materialized).  Decode gets much slower "
+                             "(measured ~0.17 tok/s on 4090 for Qwen3-8B) "
+                             "because dequant runs per matmul per token; "
+                             "prefill also spikes memory transiently.  Use "
+                             "only when fp16 weights don't fit.")
     parser.add_argument("--gpu-layers", type=int, default=-1,
                         help="GPU layers for llamacpp backend (default: -1 = all)")
     parser.add_argument("--tensor-parallel", type=int, default=1,
