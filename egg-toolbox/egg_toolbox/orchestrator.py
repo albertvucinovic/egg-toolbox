@@ -284,20 +284,22 @@ class Orchestrator:
                 if max_tokens and token_count >= max_tokens:
                     break
         finally:
-            # Close the backend generator immediately.  Python's
-            # GC would call close() eventually, but we want
-            # deterministic cancellation so the GPU stops spending
-            # cycles on tokens we've already decided to drop
-            # (stop string matched, EOS reached, max_tokens,
-            # tool_call completed, or client disconnected).  The
-            # backend's generate_tokens() has a finally that sets
-            # a threading.Event the worker checks after each
-            # yielded token; it bails out within one more forward
-            # pass at most.
-            try:
-                backend_gen.close()
-            except Exception:
-                pass
+            # Cancel the backend generation immediately.  Previously
+            # we called backend_gen.close() here, but that's a
+            # *cross-thread* generator close -- the async finally
+            # runs on the event-loop thread while the generator is
+            # being iterated on the orchestrator's executor thread.
+            # Python raises "generator already executing", which our
+            # try/except silently swallowed, so the cancellation
+            # flag was never set and tinygrad kept generating
+            # tokens for minutes after the response returned.
+            # Call the explicit cancel method instead.
+            cancel = getattr(self._backend, "cancel_generation", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
 
         # Flush any remaining text in stop matcher
         remaining = stop_matcher.flush()

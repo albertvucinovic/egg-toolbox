@@ -181,24 +181,25 @@ def test_generate_tokens_stops_backend_when_caller_stops_iterating(monkeypatch):
         if nonlocal_count >= 5:
             break
 
-    # Explicitly close (orchestrator does this too via finally).
-    gen.close()
+    # This is the exact shape of what the orchestrator's finally
+    # block does: call cancel_generation() on the backend.  Crucially
+    # we do NOT call gen.close() here -- that's cross-thread on the
+    # iterating thread, Python raises "generator already executing",
+    # and the previous implementation silently swallowed that, so
+    # cancellation never fired and tinygrad ran to max_context.
+    backend.cancel_generation()
 
-    # Wait a moment for the worker to notice the cancellation flag
-    # and exit.  If cancellation is broken, tokens_produced keeps
-    # growing toward 100_000.
+    # Wait for the worker to notice the flag and exit.
     import time
     time.sleep(0.25)
-    produced_after_close = len(tokens_produced)
+    produced_after_cancel = len(tokens_produced)
     time.sleep(0.25)
-    # No further progress after a full second.
-    assert len(tokens_produced) == produced_after_close, (
-        f"Backend kept producing tokens after close(): {produced_after_close} -> {len(tokens_produced)}"
+    assert len(tokens_produced) == produced_after_cancel, (
+        f"Backend kept producing tokens after cancel(): "
+        f"{produced_after_cancel} -> {len(tokens_produced)}"
     )
-    # Some slack: within ~a dozen extra tokens due to the check
-    # happening *after* each yield.
-    assert produced_after_close < 100, (
-        f"Backend produced {produced_after_close} tokens but caller "
+    assert produced_after_cancel < 100, (
+        f"Backend produced {produced_after_cancel} tokens but caller "
         "only asked for 5 -- cancellation flag isn't being honoured."
     )
 

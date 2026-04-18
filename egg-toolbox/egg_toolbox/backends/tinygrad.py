@@ -71,6 +71,16 @@ class TinygradBackend(StepBackend):
             max_workers=1, thread_name_prefix=_TINYGRAD_THREAD_NAME,
         )
 
+        # Cancellation flag for the currently-active generation.
+        # set() from any thread by cancel_generation(); the worker
+        # _run loop checks it after every yielded token.  We cannot
+        # use generator.close() for this because close() is a
+        # cross-thread operation on a generator that might be
+        # currently executing on another thread ("generator already
+        # executing" error), and silently swallowing that error
+        # left cancellation broken.
+        self._active_cancel: threading.Event | None = None
+
     def load_model(self, model_path: str, **kwargs: Any) -> None:
         # Hop onto the dedicated tinygrad thread so the SQLite kernel
         # cache connection (opened lazily inside from_gguf's realize())
@@ -143,6 +153,7 @@ class TinygradBackend(StepBackend):
         token_q: queue.Queue = queue.Queue()
         SENTINEL = object()
         cancelled = threading.Event()
+        self._active_cancel = cancelled
 
         def _run() -> None:
             try:
@@ -166,10 +177,21 @@ class TinygradBackend(StepBackend):
                     raise item[1]
                 yield item
         finally:
-            # Triggered either by normal exhaustion (already done)
-            # or by caller's break / close().  Set the flag so the
-            # worker stops after its current token.
             cancelled.set()
+            if self._active_cancel is cancelled:
+                self._active_cancel = None
+
+    def cancel_generation(self) -> None:
+        """Signal the currently-active generate_tokens call to stop.
+
+        Safe to call from any thread.  A no-op if nothing is
+        generating.  The worker loop checks the flag after each
+        yielded token from tinygrad, so the GPU stops within one
+        more forward pass at most.
+        """
+        ev = self._active_cancel
+        if ev is not None:
+            ev.set()
 
     def model_name(self) -> str:
         return self._model_name_str
