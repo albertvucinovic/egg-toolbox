@@ -56,7 +56,11 @@ def test_load_and_generate_run_on_same_thread(monkeypatch):
                 return _R()
         return FakeModel(), FakeKV()
 
-    monkeypatch.setattr(tg_backend, "_from_gguf_with_qkv_bias", fake_from_gguf)
+    import egg_toolbox.models as models_pkg
+    monkeypatch.setattr(
+        models_pkg, "load_from_gguf",
+        lambda path, **kw: fake_from_gguf(path, **kw),
+    )
 
     # Monkey-patch tinygrad imports inside _do_load_model to stubs.
     import sys
@@ -189,7 +193,11 @@ def test_generate_tokens_stops_backend_when_caller_stops_iterating(monkeypatch):
                 return _R()
         return FakeModel(), FakeKV()
 
-    monkeypatch.setattr(tg_backend, "_from_gguf_with_qkv_bias", fake_from_gguf)
+    import egg_toolbox.models as models_pkg
+    monkeypatch.setattr(
+        models_pkg, "load_from_gguf",
+        lambda path, **kw: fake_from_gguf(path, **kw),
+    )
 
     import sys, types
     fake_tg = types.ModuleType("tinygrad")
@@ -297,7 +305,11 @@ def test_multiple_generate_calls_share_backend_thread(monkeypatch):
                 return _R()
         return FakeModel(), FakeKV()
 
-    monkeypatch.setattr(tg_backend, "_from_gguf_with_qkv_bias", fake_from_gguf)
+    import egg_toolbox.models as models_pkg
+    monkeypatch.setattr(
+        models_pkg, "load_from_gguf",
+        lambda path, **kw: fake_from_gguf(path, **kw),
+    )
 
     import sys, types
     fake_tinygrad = types.ModuleType("tinygrad")

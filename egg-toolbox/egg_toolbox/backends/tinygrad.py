@@ -102,37 +102,19 @@ class TinygradBackend(StepBackend):
         self._executor.submit(self._do_load_model, model_path, **kwargs).result()
 
     def _do_load_model(self, model_path: str, **kwargs: Any) -> None:
-        from tinygrad import Tensor, TinyJit
         from tinygrad.apps.llm import SimpleTokenizer
+
+        from ..models import load_from_gguf
 
         model_path_obj = Path(model_path)
         self._model_name_str = model_path_obj.stem
 
-        # Build model from GGUF -- returns (model, kv_metadata).
-        # We use _from_gguf_with_qkv_bias instead of Transformer.from_gguf
-        # because tinygrad's default ignores attn_{q,k,v}.bias tensors,
-        # which Qwen2/Qwen2.5 and other archs require for correct output.
-        self._model, kv = _from_gguf_with_qkv_bias(Tensor(model_path_obj), **kwargs)
-
-        # Replace the model's forward with a logits-returning variant.
-        # tinygrad's upstream ``Transformer.forward`` folds the sampler
-        # tail (softmax + argmax) into the traced graph, so every call
-        # returns a single token id and temperature/top_p/top_k are
-        # silently ignored.  We re-express the forward to return the
-        # raw logits for the last token (shape (1, vocab_size)) and
-        # do sampling in Python via egg_toolbox.sampling.  The JIT is
-        # rebuilt against the new function so the decode-path kernel
-        # recompiles once at load time.
-        model = self._model
-
-        def _forward_logits(tokens: Any, start_pos: Any) -> Any:
-            x = model.token_embd(tokens)
-            for block in model.blk:
-                x = block(x, start_pos)
-            return model.output(model.output_norm(x))[:, -1, :]
-
-        model.forward = _forward_logits
-        model.forward_jit = TinyJit(_forward_logits)
+        # Dispatch to the right Architecture class based on GGUF
+        # ``general.architecture``.  The loaded instance already returns
+        # logits (not argmax) from its forward and has any arch-specific
+        # weight fixups applied (e.g. Qwen2 Q/K/V bias tensors, llama
+        # Q/K half-split RoPE rearrangement).
+        self._model, kv = load_from_gguf(str(model_path_obj), **kwargs)
 
         # Extract chat template from GGUF metadata
         from ..template import ChatTemplate
@@ -352,109 +334,3 @@ class TinygradBackend(StepBackend):
 
     def model_name(self) -> str:
         return self._model_name_str
-
-
-def _from_gguf_with_qkv_bias(
-    gguf,
-    max_context: int | None = None,
-    realize: bool = True,
-    keep_packed: bool = False,
-):
-    """Load a GGUF into a tinygrad Transformer, preserving attn_{q,k,v}.bias.
-
-    tinygrad's Transformer.from_gguf constructs bias-free Linear modules for
-    the attention projections, so biases present in the GGUF (Qwen2, Qwen2.5,
-    some others) are silently dropped and generation produces garbage.
-    This loader mirrors tinygrad's from_gguf but attaches zero-initialised
-    bias tensors before load_state_dict so those weights land in the model.
-
-    Memory/speed tradeoff via ``keep_packed``:
-
-    - ``keep_packed=False`` (default, matches upstream): call ``.contiguous()
-      + realize()`` on every parameter.  Weights are dequantized to fp16
-      dense tensors -> fast matmul, but an 8B Q4_0 GGUF occupies ~16 GB
-      of VRAM regardless of the on-disk quantization.
-    - ``keep_packed=True``: skip both calls.  Parameters remain lazy,
-      referring to the packed GGUF-layout tensors on-device.  tinygrad's
-      scheduler fuses the dequantize ops into each matmul kernel, so
-      the packed weights stay put.  ~4x lower weight-memory on Q4_0;
-      generation is slower because dequantize runs per-matmul.  The
-      upstream loader has a comment "without this contiguous, it unpacks
-      the weights from the model every time" explaining exactly this.
-    """
-    from tinygrad import Tensor, nn
-    from tinygrad.apps.llm import Transformer
-    from tinygrad.helpers import getenv
-
-    kv, state_dict = nn.state.gguf_load(gguf.to(None))
-
-    state_dict = {k: (v.cast("float16") if getenv("HALF", 1) else v) for k, v in state_dict.items()}
-    if "output.weight" not in state_dict:
-        state_dict["output.weight"] = state_dict["token_embd.weight"]
-
-    arch = kv["general.architecture"]
-    max_context = (
-        min(max_context, kv[f"{arch}.context_length"])
-        if max_context is not None
-        else kv[f"{arch}.context_length"]
-    )
-    n_heads = kv[f"{arch}.attention.head_count"]
-    n_kv_heads = kv[f"{arch}.attention.head_count_kv"]
-
-    if arch == "llama":
-        for name in state_dict:
-            if "attn_q.weight" in name:
-                state_dict[name] = state_dict[name].rearrange(
-                    "(n h two) d -> (n two h) d", n=n_heads, two=2
-                )
-            if "attn_k.weight" in name:
-                state_dict[name] = state_dict[name].rearrange(
-                    "(n h two) d -> (n two h) d", n=n_kv_heads, two=2
-                )
-
-    model = Transformer(
-        num_blocks=kv[f"{arch}.block_count"],
-        dim=kv[f"{arch}.embedding_length"],
-        hidden_dim=kv.get(
-            f"{arch}.expert_feed_forward_length", kv[f"{arch}.feed_forward_length"]
-        ),
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        norm_eps=kv[f"{arch}.attention.layer_norm_rms_epsilon"],
-        vocab_size=len(kv["tokenizer.ggml.tokens"]),
-        head_dim=kv.get(
-            f"{arch}.attention.key_length", kv[f"{arch}.embedding_length"] // n_heads
-        ),
-        rope_theta=kv[f"{arch}.rope.freq_base"],
-        max_context=max_context,
-        qk_norm=int(state_dict["blk.0.attn_q_norm.weight"].shape[0])
-        if "blk.0.attn_q_norm.weight" in state_dict
-        else 0,
-        num_experts=kv.get(f"{arch}.expert_count", 0),
-        num_experts_per_tok=kv.get(f"{arch}.expert_used_count", 0),
-    )
-
-    # Attach zero-init bias tensors so load_state_dict can populate them.
-    # tinygrad's TransformerBlock builds Q/K/V Linear with bias=False.
-    if "blk.0.attn_q.bias" in state_dict:
-        half = getenv("HALF", 1)
-        dtype = "float16" if half else state_dict["blk.0.attn_q.bias"].dtype
-        for i, block in enumerate(model.blk):
-            for proj in ("attn_q", "attn_k", "attn_v"):
-                key = f"blk.{i}.{proj}.bias"
-                if key in state_dict:
-                    out_features = state_dict[key].shape[0]
-                    getattr(block, proj).bias = Tensor.zeros(out_features, dtype=dtype)
-
-    nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)
-    if keep_packed:
-        # Memory-efficient path: do NOT materialize the dequantized fp16
-        # weights.  tinygrad's scheduler will fuse dequant ops into each
-        # matmul, so packed GGUF weights stay on device.  Generation is
-        # slower but weight memory drops to roughly the on-disk size.
-        return model, kv
-    for s in (params := nn.state.get_parameters(model)):
-        s.replace(s.contiguous())
-    if realize:
-        Tensor.realize(*params)
-    return model, kv
