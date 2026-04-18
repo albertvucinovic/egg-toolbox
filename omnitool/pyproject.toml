@@ -1,0 +1,24 @@
+[project]
+name = "omnitool"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Universal tool calling middleware for local LLMs"
+dependencies = [
+    "jinja2>=3.1",
+    "starlette>=0.36",
+    "uvicorn[standard]>=0.27",
+]
+
+[project.optional-dependencies]
+tinygrad = ["tinygrad"]
+vllm = ["vllm>=0.6"]
+sglang = ["sglang"]
+llamacpp = ["llama-cpp-python>=0.3"]
+dev = ["pytest", "pytest-asyncio", "httpx"]
+
+[project.scripts]
+omnitool = "omnitool.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

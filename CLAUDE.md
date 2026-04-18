@@ -47,23 +47,40 @@ bd close <id>         # Complete work
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
+- **EXCEPTION: No remote origin** - If `git remote get-url origin` fails (no origin configured), skip the push step but WARN the user: "No git remote origin is configured. You should set one up with `git remote add origin <url>` to avoid losing work."
 <!-- END BEADS INTEGRATION -->
 
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+# Create/activate venv
+python3 -m venv /workspace/omnitool/.venv
+source /workspace/omnitool/.venv/bin/activate
+
+# Install with dev deps
+pip install -e "/workspace/omnitool[dev]"
+
+# Run tests
+/workspace/omnitool/.venv/bin/python -m pytest /workspace/omnitool/tests/
+
+# Quick import check
+/workspace/omnitool/.venv/bin/python -c "from omnitool.types import *; print('OK')"
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+See `omnitool/context.md` for full architecture. Key flow:
+- API Request -> Orchestrator -> ChatTemplate.render() -> Backend.generate_tokens() -> StreamingParser -> SemanticEvent stream -> API SSE projection
+- Universal IR: `SemanticEvent` -- both OpenAI and Anthropic APIs are lossless projections
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Pure Python, no Rust/C extensions
+- Frozen dataclasses (not Pydantic) for all data types
+- Starlette (not FastAPI) for HTTP
+- Two backend ABCs: StepBackend (token-by-token) vs ConstraintBackend (text chunks)
+- Per-format state machine parsers (not regex) for streaming
+- Format detection at model load (not per-request)
+- Design docs: `docs/omnitool-plan.md`, `docs/omnitool-architecture.md`
+- Session continuation: `docs/omnitool-new-session.md`
