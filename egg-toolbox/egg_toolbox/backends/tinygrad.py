@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterator
 
 from .base import StepBackend, Tokenizer
 from ..types import CompiledRequest
+
+
+# All tinygrad calls (model load + every generate_tokens invocation)
+# must happen on the same OS thread.  tinygrad caches its
+# kernel-compile SQLite connection in a process global, but sqlite3
+# rejects cross-thread use.  We pin everything to a single dedicated
+# worker thread here.
+_TINYGRAD_THREAD_NAME = "egg-tinygrad"
 
 
 class TinygradTokenizer(Tokenizer):
@@ -52,7 +63,21 @@ class TinygradBackend(StepBackend):
         self._model_name_str: str = ""
         self._chat_template: str = ""
 
+        # Dedicated worker thread for ALL tinygrad operations.  See
+        # module-level comment above -- tinygrad's sqlite kernel cache
+        # is thread-bound, so load_model AND every generate_tokens
+        # iteration must run on the same OS thread.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=_TINYGRAD_THREAD_NAME,
+        )
+
     def load_model(self, model_path: str, **kwargs: Any) -> None:
+        # Hop onto the dedicated tinygrad thread so the SQLite kernel
+        # cache connection (opened lazily inside from_gguf's realize())
+        # is created there.
+        self._executor.submit(self._do_load_model, model_path, **kwargs).result()
+
+    def _do_load_model(self, model_path: str, **kwargs: Any) -> None:
         from tinygrad import Tensor
         from tinygrad.apps.llm import SimpleTokenizer
 
@@ -88,10 +113,37 @@ class TinygradBackend(StepBackend):
         return self._chat_template
 
     def generate_tokens(self, request: CompiledRequest) -> Iterator[int]:
-        """Wrap Transformer.generate() which already yields token IDs."""
+        """Yield token IDs one at a time.
+
+        The actual call to ``Transformer.generate()`` runs on the
+        dedicated tinygrad worker thread (where the sqlite kernel
+        cache connection lives).  Tokens are ferried back to the
+        caller's thread through a bounded queue; the caller iterates
+        as if the generator were native.
+        """
         assert self._model is not None, "Model not loaded"
-        for token_id in self._model.generate(list(request.prompt_tokens)):
-            yield token_id
+
+        token_q: queue.Queue = queue.Queue(maxsize=64)
+        SENTINEL = object()
+
+        def _run() -> None:
+            try:
+                for tid in self._model.generate(list(request.prompt_tokens)):
+                    token_q.put(tid)
+            except BaseException as exc:  # noqa: BLE001
+                token_q.put(("__error__", exc))
+            finally:
+                token_q.put(SENTINEL)
+
+        self._executor.submit(_run)
+
+        while True:
+            item = token_q.get()
+            if item is SENTINEL:
+                return
+            if isinstance(item, tuple) and item and item[0] == "__error__":
+                raise item[1]
+            yield item
 
     def model_name(self) -> str:
         return self._model_name_str
