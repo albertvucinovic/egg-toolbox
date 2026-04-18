@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from ..types import FormatAnalysis, ToolFormatMode
 from .base import FormatHandler
+from .command_r import CommandRHandler
 from .deepseek import DeepSeekHandler
+from .functionary import FunctionaryHandler
 from .generic import GenericHandler
 from .hermes import HermesHandler
 from .llama3 import Llama3Handler
@@ -19,10 +21,14 @@ def get_handler_for_format(analysis: FormatAnalysis) -> FormatHandler:
         return MistralHandler(analysis)
     if analysis.tool_mode == ToolFormatMode.DEEPSEEK:
         return DeepSeekHandler(analysis)
+    if analysis.tool_mode == ToolFormatMode.COMMAND_R:
+        return CommandRHandler(analysis)
+    if analysis.tool_mode in (ToolFormatMode.FUNCTIONARY_V3, ToolFormatMode.FUNCTIONARY_V3_1):
+        return FunctionaryHandler(analysis)
     if analysis.tool_mode == ToolFormatMode.GENERIC_JSON:
         return GenericHandler(analysis)
-    # Phase 2 remaining: functionary, command_r, harmony
-    # Until those land, fall back to Hermes for any format that has tools.
+    # Phase 2 remaining: harmony
+    # Until that lands, fall back to Hermes for any format that has tools.
     if analysis.tool_mode != ToolFormatMode.NONE:
         return HermesHandler(analysis)
     # No tool support detected -- Hermes acts as a passthrough.
