@@ -1,12 +1,22 @@
 # egg-toolbox
 
-Universal tool calling middleware for local LLMs. A drop-in OpenAI-compatible API server that adds structured tool calling to any model whose chat template supports a tool-call format (Hermes, Llama 3, Mistral, DeepSeek, etc.) — without requiring that model to be fine-tuned for OpenAI-style `tool_calls` output.
+Universal tool calling middleware for local LLMs. A drop-in OpenAI-compatible API server that adds structured tool calling to any model whose chat template supports a tool-call format (Hermes, Llama 3, Mistral, DeepSeek, Command-R, Functionary, Harmony, ...) — without requiring that model to be fine-tuned for OpenAI-style `tool_calls` output.
+
+## Goal
+
+egg-toolbox aims to become the **default tool-calling frontend for every major local inference engine** — tinygrad, vLLM, SGLang, llama.cpp — so that adding tool support for a newly released model is a one-place change that benefits all backends simultaneously.
+
+- **One format, one handler.** Each tool-call format (Hermes, Llama 3, Mistral, DeepSeek, ...) has a single state-machine parser in pure Python with no backend dependency. Supporting a new model family means writing the handler once.
+- **Day-one support.** When a new model is released (a new Qwen, a new DeepSeek, a new Harmony variant), the path to tool-call support runs through egg-toolbox and lights up tinygrad / vLLM / SGLang / llama.cpp together rather than waiting for each engine to ship its own integration.
+- **Backend-neutral design.** Two backend ABCs — `StepBackend` (token-by-token engines like tinygrad, llama-cpp-python) and `ConstraintBackend` (batch engines like vLLM, SGLang) — mean the same format layer works for both decoding styles. Grammar/constraint injection and streaming parse happen at request boundaries, not inside the decode loop, so overhead is near zero on batch engines.
 
 ## Status
 
-- **Phase 1 complete**: types, template engine, streaming parser, tinygrad backend, OpenAI-compatible `/v1/chat/completions` (streaming + non-streaming), token-usage accounting, `tool_choice`, `stream_options`, error handling.
-- **Phase 2 in progress**: format handlers for non-Hermes models. Hermes (Qwen, NousResearch Hermes fine-tunes) and Llama 3 formats are implemented; Mistral / DeepSeek / Functionary / Command-R / Harmony / Generic still TODO.
-- **End-to-end verified**: `egg-mono` (OpenAI-compat client) → `egg-toolbox` → tinygrad → Qwen2.5-0.5B-Instruct with clean tool-call round-trips.
+- **Phase 1 (complete):** types, template engine, streaming parser, tinygrad backend, OpenAI-compatible `/v1/chat/completions` (streaming + non-streaming), token-usage accounting, `tool_choice`, `stream_options`, error handling.
+- **Phase 2 (in progress):** format handlers. **Hermes, Llama 3, Mistral, DeepSeek, Command-R, Functionary (v3 + v3.1), and Generic** are shipped. Harmony (OpenAI gpt-oss multi-channel) is next.
+- **Phase 3 (planned):** vLLM, SGLang, and llama-cpp-python backends.
+- **Phase 4 (planned):** GBNF grammar generation, Anthropic `/v1/messages` projection, full differential template-analysis detector, parallel-tool streaming, grammar-guided speculative decoding.
+- **End-to-end verified:** `egg-mono` (OpenAI-compat client) → `egg-toolbox` → tinygrad → Qwen2.5-0.5B-Instruct with clean tool-call round-trips.
 
 ## Repository layout
 
