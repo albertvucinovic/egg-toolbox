@@ -40,11 +40,19 @@ def test_load_and_generate_run_on_same_thread(monkeypatch):
                 except KeyError:
                     return default
 
+        class _Jit:
+            def reset(self):
+                pass
+
         class FakeModel:
-            def generate(self, tokens):
+            max_context = 1024
+            forward_jit = _Jit()
+            def __call__(self, t, start_pos):
                 thread_ids.append(("generate", threading.get_ident()))
-                for _ in range(3):
-                    yield 1
+                class _R:
+                    def item(self_inner):
+                        return 1
+                return _R()
         return FakeModel(), FakeKV()
 
     monkeypatch.setattr(tg_backend, "_from_gguf_with_qkv_bias", fake_from_gguf)
@@ -55,9 +63,19 @@ def test_load_and_generate_run_on_same_thread(monkeypatch):
 
     fake_tinygrad = types.ModuleType("tinygrad")
     class _FakeTensor:
-        def __init__(self, *args, **kwargs):
-            pass
+        def __init__(self, data=None, *args, **kwargs):
+            seq = data[0] if (isinstance(data, list) and data) else []
+            self.shape = (1, len(seq) if isinstance(seq, list) else 1)
+    class _FakeUOpVar:
+        def bind(self, v):
+            return v
+    class _FakeUOp:
+        @staticmethod
+        def variable(name, lo, hi):
+            return _FakeUOpVar()
     fake_tinygrad.Tensor = _FakeTensor
+    fake_tinygrad.UOp = _FakeUOp
+    fake_tinygrad.getenv = lambda name, default=1: default
     monkeypatch.setitem(sys.modules, "tinygrad", fake_tinygrad)
 
     fake_apps_llm = types.ModuleType("tinygrad.apps.llm")
@@ -87,19 +105,28 @@ def test_load_and_generate_run_on_same_thread(monkeypatch):
     req = CompiledRequest(prompt_tokens=(1, 2, 3), sampling=SamplingParams(),
                          stop_strings=(), stop_token_ids=())
 
-    # Consume a few tokens from generate_tokens.
-    tokens = list(backend.generate_tokens(req))
-    assert len(tokens) == 3
+    # Consume a few tokens from generate_tokens, then stop.  The new
+    # forward-driven path yields until max_context, so we break out
+    # ourselves and let cancellation fire the producer's exit.
+    tokens = []
+    for tid in backend.generate_tokens(req):
+        tokens.append(tid)
+        if len(tokens) >= 3:
+            break
+    backend.cancel_generation()
+    assert tokens == [1, 1, 1]
 
-    # Load AND generate must have run on the same worker thread,
-    # which is NOT the caller's thread (the test runs on main).
-    assert len(thread_ids) == 2
+    # Load AND at least one generate forward must have run on the
+    # same worker thread, which is NOT the caller's (test runs on
+    # main).
     assert thread_ids[0][0] == "load"
-    assert thread_ids[1][0] == "generate"
-    assert thread_ids[0][1] == thread_ids[1][1], (
+    assert any(kind == "generate" for kind, _ in thread_ids)
+    load_tid = thread_ids[0][1]
+    gen_tids = [tid for kind, tid in thread_ids if kind == "generate"]
+    assert all(tid == load_tid for tid in gen_tids), (
         f"Load and generate ran on different threads: {thread_ids}"
     )
-    assert thread_ids[0][1] != threading.get_ident(), (
+    assert load_tid != threading.get_ident(), (
         "Load ran on the caller's thread -- not pinned to a backend "
         "worker thread."
     )
@@ -129,19 +156,28 @@ def test_generate_tokens_stops_backend_when_caller_stops_iterating(monkeypatch):
             def __getitem__(self, key):
                 return self.get(key, 0)
 
+        class _Jit:
+            def reset(self):
+                pass
+
         class FakeModel:
-            def generate(self, prompt_tokens):
-                # Simulate tinygrad's per-token GPU cost (~1 tok/s)
+            max_context = 10_000
+            forward_jit = _Jit()
+            _counter = [0]
+            def __call__(self, t, start_pos):
+                # Simulate tinygrad's per-token GPU cost (~200 tok/s)
                 # so the producer doesn't get thousands of tokens
                 # ahead of the consumer -- the test's purpose is to
                 # verify cancellation, not queue-throughput.
                 import time as _t
-                i = 0
-                while i < 10_000:
-                    i += 1
-                    tokens_produced.append(i)
-                    _t.sleep(0.005)   # 5 ms per token
-                    yield i
+                self._counter[0] += 1
+                tokens_produced.append(self._counter[0])
+                _t.sleep(0.005)   # 5 ms per forward
+                val = self._counter[0]
+                class _R:
+                    def item(self_inner):
+                        return val
+                return _R()
         return FakeModel(), FakeKV()
 
     monkeypatch.setattr(tg_backend, "_from_gguf_with_qkv_bias", fake_from_gguf)
@@ -149,8 +185,17 @@ def test_generate_tokens_stops_backend_when_caller_stops_iterating(monkeypatch):
     import sys, types
     fake_tg = types.ModuleType("tinygrad")
     class _FakeTensor:
-        def __init__(self, *args, **kwargs): pass
+        def __init__(self, data=None, *args, **kwargs):
+            seq = data[0] if (isinstance(data, list) and data) else []
+            self.shape = (1, len(seq) if isinstance(seq, list) else 1)
+    class _FakeUOpVar:
+        def bind(self, v): return v
+    class _FakeUOp:
+        @staticmethod
+        def variable(name, lo, hi): return _FakeUOpVar()
     fake_tg.Tensor = _FakeTensor
+    fake_tg.UOp = _FakeUOp
+    fake_tg.getenv = lambda name, default=1: default
     monkeypatch.setitem(sys.modules, "tinygrad", fake_tg)
 
     fake_llm = types.ModuleType("tinygrad.apps.llm")
@@ -223,10 +268,19 @@ def test_multiple_generate_calls_share_backend_thread(monkeypatch):
             def __getitem__(self, key):
                 return self.get(key, 0)
 
+        class _Jit:
+            def reset(self):
+                pass
+
         class FakeModel:
-            def generate(self, tokens):
+            max_context = 1024
+            forward_jit = _Jit()
+            def __call__(self, t, start_pos):
                 generate_thread_ids.append(threading.get_ident())
-                yield 1
+                class _R:
+                    def item(self_inner):
+                        return 1
+                return _R()
         return FakeModel(), FakeKV()
 
     monkeypatch.setattr(tg_backend, "_from_gguf_with_qkv_bias", fake_from_gguf)
@@ -234,8 +288,17 @@ def test_multiple_generate_calls_share_backend_thread(monkeypatch):
     import sys, types
     fake_tinygrad = types.ModuleType("tinygrad")
     class _FakeTensor:
-        def __init__(self, *args, **kwargs): pass
+        def __init__(self, data=None, *args, **kwargs):
+            seq = data[0] if (isinstance(data, list) and data) else []
+            self.shape = (1, len(seq) if isinstance(seq, list) else 1)
+    class _FakeUOpVar:
+        def bind(self, v): return v
+    class _FakeUOp:
+        @staticmethod
+        def variable(name, lo, hi): return _FakeUOpVar()
     fake_tinygrad.Tensor = _FakeTensor
+    fake_tinygrad.UOp = _FakeUOp
+    fake_tinygrad.getenv = lambda name, default=1: default
     monkeypatch.setitem(sys.modules, "tinygrad", fake_tinygrad)
 
     fake_apps_llm = types.ModuleType("tinygrad.apps.llm")
@@ -257,12 +320,17 @@ def test_multiple_generate_calls_share_backend_thread(monkeypatch):
     backend.load_model("fake.gguf")
 
     from egg_toolbox.types import CompiledRequest, SamplingParams
-    for _ in range(3):
-        req = CompiledRequest(prompt_tokens=(1,), sampling=SamplingParams(),
+    for i in range(3):
+        # Different prompt per request so prefix-cache path still
+        # executes the forward for at least one token each time.
+        req = CompiledRequest(prompt_tokens=(i + 10, i + 11),
+                             sampling=SamplingParams(),
                              stop_strings=(), stop_token_ids=())
-        list(backend.generate_tokens(req))
+        for _ in backend.generate_tokens(req):
+            break  # one token is enough to assert thread identity
+        backend.cancel_generation()
 
-    assert len(generate_thread_ids) == 3
+    assert len(generate_thread_ids) >= 3
     assert len(set(generate_thread_ids)) == 1, (
         f"Three generate calls ran on different threads: {generate_thread_ids}"
     )

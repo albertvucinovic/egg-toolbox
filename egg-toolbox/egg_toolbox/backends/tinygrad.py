@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -81,6 +82,19 @@ class TinygradBackend(StepBackend):
         # left cancellation broken.
         self._active_cancel: threading.Event | None = None
 
+        # Prompt-prefix KV cache bookkeeping.  tinygrad's
+        # TransformerBlock keeps a persistent ``cache_kv`` tensor
+        # keyed by (start_pos, T); upstream Transformer.generate
+        # always passes start_pos=0 so the cache is overwritten from
+        # scratch every request.  We drive the forward path ourselves
+        # and keep _cache_tokens = the ordered tokens whose K/V
+        # currently sit in every block's cache_kv[0:len).  On a new
+        # request we feed only the suffix past the longest common
+        # prefix; on exception/cancel we reset to [] to stay
+        # consistent with whatever the cache now contains.  Setting
+        # EGG_PREFIX_CACHE=0 disables the whole mechanism.
+        self._cache_tokens: list[int] = []
+
     def load_model(self, model_path: str, **kwargs: Any) -> None:
         # Hop onto the dedicated tinygrad thread so the SQLite kernel
         # cache connection (opened lazily inside from_gguf's realize())
@@ -157,11 +171,14 @@ class TinygradBackend(StepBackend):
 
         def _run() -> None:
             try:
-                for tid in self._model.generate(list(request.prompt_tokens)):
+                for tid in self._iter_model_tokens(request, cancelled):
                     if cancelled.is_set():
                         break
                     token_q.put(tid)
             except BaseException as exc:  # noqa: BLE001
+                # Cache may be partially written; next request must
+                # prefill from 0 to avoid attending to stale K/V.
+                self._cache_tokens = []
                 token_q.put(("__error__", exc))
             finally:
                 token_q.put(SENTINEL)
@@ -192,6 +209,89 @@ class TinygradBackend(StepBackend):
         ev = self._active_cancel
         if ev is not None:
             ev.set()
+
+    def _iter_model_tokens(
+        self,
+        request: CompiledRequest,
+        cancelled: threading.Event,
+    ) -> Iterator[int]:
+        """Drive tinygrad's Transformer forward path while reusing the
+        per-block cache_kv for the longest token prefix shared with
+        the previous request.
+
+        We bypass ``Transformer.generate`` because its line
+        ``start_pos = 0`` discards the start-pos argument and its
+        ``forward_jit.reset()`` drops the T=1 decode kernel between
+        requests.  Both defeat prefix caching.
+
+        Invariant maintained: ``self._cache_tokens`` equals the
+        ordered tokens currently resident in each block's
+        ``cache_kv[0:len(self._cache_tokens))``.  The invariant is
+        preserved across cancel and across the producer's normal
+        exit.  On exception the outer ``_run`` clears it.
+        """
+        from tinygrad import Tensor, UOp, getenv
+
+        model = self._model
+        assert model is not None
+
+        prompt_list = list(request.prompt_tokens)
+        assert prompt_list, "empty prompt_tokens"
+
+        enable_cache = os.environ.get("EGG_PREFIX_CACHE", "1") != "0"
+
+        # --- Find longest common prefix with the resident cache. ----
+        if enable_cache:
+            cached = self._cache_tokens
+            cp = 0
+            cap = min(len(cached), len(prompt_list))
+            while cp < cap and cached[cp] == prompt_list[cp]:
+                cp += 1
+        else:
+            cp = 0
+
+        # If the new prompt is fully contained in the cache we still
+        # need to run forward on at least one input token to produce
+        # the next-token logits.  Roll back by 1 and re-feed that
+        # token at its position -- the cache_kv slot will be rewritten
+        # identically, so correctness is preserved.
+        if cp == len(prompt_list):
+            cp -= 1
+        assert cp >= 0
+
+        new_suffix = prompt_list[cp:]
+
+        # --- Prefill the diverging suffix. --------------------------
+        # T > 1 -> non-JIT forward path (matches upstream generate).
+        t = Tensor([new_suffix], dtype="int32")
+        t = model(t, cp)
+        # cache_kv[0:len(prompt_list)) now reflects prompt_list exactly.
+        self._cache_tokens = list(prompt_list)
+        next_id = int(t.item())
+        yield next_id
+
+        # --- Decode loop. -------------------------------------------
+        # T = 1 with UOp-bound start_pos: hits the JITted kernel, which
+        # persists across requests because start_pos is symbolic.  We
+        # intentionally do NOT call forward_jit.reset().
+        v_start_pos = UOp.variable("start_pos", 1, model.max_context - 1)
+        pos = len(prompt_list)
+        max_ctx = model.max_context
+        use_sym = bool(getenv("SYM", 1))
+        while pos < max_ctx:
+            if cancelled.is_set():
+                break
+            t = Tensor([[next_id]], dtype="int32")
+            sp = v_start_pos.bind(pos) if use_sym else pos
+            t = model(t, sp)
+            # We've just fed `next_id` at cache position `pos`.  The
+            # assign in _attention writes cache_kv[pos:pos+1), and the
+            # resident-tokens list must grow in lockstep so that if a
+            # cancel arrives right now, the invariant still holds.
+            self._cache_tokens.append(next_id)
+            pos += 1
+            next_id = int(t.item())
+            yield next_id
 
     def model_name(self) -> str:
         return self._model_name_str
