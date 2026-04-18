@@ -50,6 +50,15 @@ class _StreamingBodyExtractor:
         self._depth = 0                 # JSON nesting depth
         self._in_string = False
         self._escape = False
+        # True immediately after the outer '{' until we've seen the
+        # first non-whitespace char inside the body.  If that first
+        # char is another '{', we're dealing with Hermes's doubled-
+        # brace tokenization quirk ('{{...}}' emitted as single BPE
+        # tokens) and must consume it transparently -- otherwise the
+        # state machine would error and nothing would stream.  The
+        # mirrored trailing '}' falls through the AFTER_CLOSE state
+        # unchanged (we only ever count depth from one opener).
+        self._just_opened = False
 
         # Key accumulation (at depth 1, while reading a key string).
         self._current_key = ""
@@ -125,6 +134,7 @@ class _StreamingBodyExtractor:
             if ch == "{":
                 self._depth = 1
                 self._state = self._EXPECT_KEY
+                self._just_opened = True
                 return
             raise ValueError(f"expected {{, got {ch!r}")
 
@@ -199,6 +209,12 @@ class _StreamingBodyExtractor:
             return
 
         if self._state == self._EXPECT_KEY:
+            if self._just_opened and ch == "{":
+                # Hermes doubled-brace quirk: silently consume the
+                # extra opener and stay in EXPECT_KEY.  Depth stays 1.
+                self._just_opened = False
+                return
+            self._just_opened = False
             if ch == '"':
                 self._in_string = True
                 self._current_key = ""
@@ -404,6 +420,14 @@ class HermesParserState(FormatParserState):
         # Active streaming extractor inside a <tool_call> body.  Created
         # fresh on every open-tag, harvested/committed on close-tag.
         self._extractor: _StreamingBodyExtractor | None = None
+        # Per-current-tool bookkeeping for the commit-time safety net.
+        # If the streaming extractor errored before emitting NAME or
+        # any ARGS deltas, the wire only saw TOOL_CALL_START with an
+        # empty function.name/arguments -- the client has nothing to
+        # execute.  We track what did reach the wire and catch up at
+        # commit time, BEFORE emitting TOOL_CALL_COMMIT.
+        self._current_name_emitted = False
+        self._current_args_streamed = False
 
     def feed_token(self, token_id: int, token_text: str) -> list[SemanticEvent]:
         events: list[SemanticEvent] = []
@@ -454,6 +478,8 @@ class HermesParserState(FormatParserState):
             self._extractor = _StreamingBodyExtractor(
                 self._analysis.name_field, self._analysis.args_field,
             )
+            self._current_name_emitted = False
+            self._current_args_streamed = False
             tool_call_id = f"call_{self._tool_index}"
             events.append(SemanticEvent(
                 kind=EventKind.TOOL_CALL_START,
@@ -496,20 +522,7 @@ class HermesParserState(FormatParserState):
             self._extractor.feed_chars(self._buffer[:idx])
             self._buffer = self._buffer[idx + len(self._tag_end):]
             # Harvest final name + args fragment before committing.
-            name_ready = self._extractor.drain_name_if_ready()
-            if name_ready is not None:
-                events.append(SemanticEvent(
-                    kind=EventKind.TOOL_CALL_NAME,
-                    tool_index=self._tool_index,
-                    tool_name=name_ready,
-                ))
-            final_args = self._extractor.drain_args()
-            if final_args:
-                events.append(SemanticEvent(
-                    kind=EventKind.TOOL_ARGS_DELTA,
-                    tool_index=self._tool_index,
-                    text=final_args,
-                ))
+            events.extend(self._drain_extractor_events())
             events.extend(self._commit_streaming_tool_call())
             self._state = _HermesState.AFTER_TOOL_CALL
             return events
@@ -533,7 +546,9 @@ class HermesParserState(FormatParserState):
 
         Called at the end of each token-chunk feed so that each backend
         token that contributed to the name or args produces at most one
-        NAME (first time only) and one ARGS_DELTA event.
+        NAME (first time only) and one ARGS_DELTA event.  Sets the
+        per-call emission flags so the commit-time catch-up knows
+        whether it needs to fill in missing pieces.
         """
         assert self._extractor is not None
         events: list[SemanticEvent] = []
@@ -544,6 +559,7 @@ class HermesParserState(FormatParserState):
                 tool_index=self._tool_index,
                 tool_name=name_ready,
             ))
+            self._current_name_emitted = True
         args_delta = self._extractor.drain_args()
         if args_delta:
             events.append(SemanticEvent(
@@ -551,6 +567,7 @@ class HermesParserState(FormatParserState):
                 tool_index=self._tool_index,
                 text=args_delta,
             ))
+            self._current_args_streamed = True
         return events
 
     def _commit_streaming_tool_call(self) -> list[SemanticEvent]:
@@ -558,6 +575,14 @@ class HermesParserState(FormatParserState):
         args.  Deltas have already gone out during streaming; COMMIT
         carries the canonical parsed values for non-streaming consumers
         (which accumulate from COMMIT, not from deltas).
+
+        Safety net: if the streaming extractor never got the NAME or
+        any ARGS onto the wire (errored mid-parse, or the body had a
+        form it couldn't handle), emit catch-up TOOL_CALL_NAME and/or
+        TOOL_ARGS_DELTA events BEFORE committing, built from the
+        tolerant body parse.  Without this, the OpenAI client sees
+        finish_reason=tool_calls with an empty tool_calls entry and
+        drops the call entirely.
 
         Always advances ``_tool_index`` -- the model clearly *intended*
         a tool call by opening <tool_call>.
@@ -577,16 +602,28 @@ class HermesParserState(FormatParserState):
         if not name:
             name = extractor.name()
 
-        tool_call_id = f"call_{self._tool_index}"
-        events = [
-            SemanticEvent(
-                kind=EventKind.TOOL_CALL_COMMIT,
+        events: list[SemanticEvent] = []
+        if not self._current_name_emitted and name:
+            events.append(SemanticEvent(
+                kind=EventKind.TOOL_CALL_NAME,
                 tool_index=self._tool_index,
-                tool_call_id=tool_call_id,
                 tool_name=name,
-                tool_arguments=args,
-            ),
-        ]
+            ))
+        if not self._current_args_streamed and args:
+            events.append(SemanticEvent(
+                kind=EventKind.TOOL_ARGS_DELTA,
+                tool_index=self._tool_index,
+                text=args,
+            ))
+
+        tool_call_id = f"call_{self._tool_index}"
+        events.append(SemanticEvent(
+            kind=EventKind.TOOL_CALL_COMMIT,
+            tool_index=self._tool_index,
+            tool_call_id=tool_call_id,
+            tool_name=name,
+            tool_arguments=args,
+        ))
         self._committed_tools.append({"name": name, "arguments": args})
         self._tool_index += 1
         return events
@@ -658,6 +695,8 @@ class HermesParserState(FormatParserState):
             self._extractor = _StreamingBodyExtractor(
                 self._analysis.name_field, self._analysis.args_field,
             )
+            self._current_name_emitted = False
+            self._current_args_streamed = False
             tool_call_id = f"call_{self._tool_index}"
             events.append(SemanticEvent(
                 kind=EventKind.TOOL_CALL_START,
@@ -697,22 +736,11 @@ class HermesParserState(FormatParserState):
                 self._extractor = _StreamingBodyExtractor(
                     self._analysis.name_field, self._analysis.args_field,
                 )
+                self._current_name_emitted = False
+                self._current_args_streamed = False
             self._extractor.feed_chars(self._buffer)
             self._buffer = ""
-            name_ready = self._extractor.drain_name_if_ready()
-            if name_ready is not None:
-                events.append(SemanticEvent(
-                    kind=EventKind.TOOL_CALL_NAME,
-                    tool_index=self._tool_index,
-                    tool_name=name_ready,
-                ))
-            final_args = self._extractor.drain_args()
-            if final_args:
-                events.append(SemanticEvent(
-                    kind=EventKind.TOOL_ARGS_DELTA,
-                    tool_index=self._tool_index,
-                    text=final_args,
-                ))
+            events.extend(self._drain_extractor_events())
             events.extend(self._commit_streaming_tool_call())
         elif self._buffer:
             if self._state in (_HermesState.CONTENT, _HermesState.AFTER_TOOL_CALL):

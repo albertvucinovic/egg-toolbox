@@ -223,6 +223,92 @@ def test_malformed_body_falls_back_to_buffered_parse():
     )
 
 
+def test_doubled_brace_still_streams_name_and_args():
+    """P0 bug: the Hermes doubled-brace quirk ('{{...}}' as a single
+    BPE token at body open, mirrored at close) was silently killing
+    streaming.  The JSON state machine errored on the second '{',
+    no TOOL_CALL_NAME or TOOL_ARGS_DELTA events reached the client,
+    and finish_reason=tool_calls arrived with an empty tool_calls
+    entry -- the client then had nothing to execute.
+
+    Fix: handle the doubled-brace quirk inline so streaming still
+    projects name and args.
+    """
+    state = _make_state()
+    text = '<tool_call>{{"name": "weather", "arguments": {"city": "Zagreb"}}}</tool_call>'
+    events = _feed(state, text, chunk=1)
+
+    # Name must be emitted at least once with the correct value.
+    name_events = [e for e in events if e.kind == EventKind.TOOL_CALL_NAME]
+    assert len(name_events) >= 1, (
+        f"doubled-brace body: no TOOL_CALL_NAME events emitted; "
+        f"client would have no tool name to execute. Events: {_kinds(events)}"
+    )
+    assert name_events[0].tool_name == "weather", (
+        f"expected name 'weather', got {name_events[0].tool_name!r}"
+    )
+
+    # Args must be emitted with the city value.
+    combined = _collect_args_text(events)
+    assert "Zagreb" in combined, (
+        f"doubled-brace body: args streaming dropped the payload. "
+        f"combined={combined!r}"
+    )
+    assert '"city"' in combined
+
+
+def test_unstreamable_body_emits_catchup_from_commit(monkeypatch):
+    """Safety net: even if the streaming extractor fails entirely and
+    emits nothing during the body, the COMMIT path must emit at least
+    one TOOL_CALL_NAME and one TOOL_ARGS_DELTA so the client sees a
+    callable tool_call.  Without this, finish_reason=tool_calls
+    arrives with empty name/args and the client drops the call.
+
+    We simulate total streaming failure by swapping the extractor
+    with one that errors immediately and emits nothing.
+    """
+    import egg_toolbox.formats.hermes as hermes_mod
+
+    class _AlwaysErrorExtractor:
+        def __init__(self, name_field="name", args_field="arguments"):
+            self._body: list[str] = []
+            self.errored = True   # pretend we errored immediately
+        def feed_chars(self, text):
+            self._body.append(text)
+        def drain_args(self):
+            return ""
+        def drain_name_if_ready(self):
+            return None
+        def full_body(self):
+            return "".join(self._body)
+        def name(self):
+            return ""
+
+    monkeypatch.setattr(
+        hermes_mod, "_StreamingBodyExtractor", _AlwaysErrorExtractor,
+    )
+    state = _make_state()
+    text = (
+        '<tool_call>{"name": "fetch", "arguments": {"url": "https://x"}}'
+        '</tool_call>'
+    )
+    events = _feed(state, text, chunk=3)
+
+    name_events = [e for e in events if e.kind == EventKind.TOOL_CALL_NAME]
+    args_events = [e for e in events if e.kind == EventKind.TOOL_ARGS_DELTA]
+    assert len(name_events) >= 1, (
+        f"catch-up failed: no TOOL_CALL_NAME after streaming errored. "
+        f"Events: {_kinds(events)}"
+    )
+    assert name_events[0].tool_name == "fetch"
+    assert len(args_events) >= 1, (
+        f"catch-up failed: no TOOL_ARGS_DELTA after streaming errored. "
+        f"Events: {_kinds(events)}"
+    )
+    combined = "".join(e.text for e in args_events if e.text)
+    assert "https://x" in combined
+
+
 def test_content_before_tool_call_still_streams():
     """The prefix content before <tool_call> must still arrive as
     CONTENT_DELTA events; this regression was NOT a streaming-args
