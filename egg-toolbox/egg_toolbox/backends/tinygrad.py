@@ -312,11 +312,18 @@ class TinygradBackend(StepBackend):
         # Restore tinygrad's schedule_cache from disk before warmup so
         # positions we've seen in prior runs don't re-run the schedule
         # pass.  Under EGG_SCHEDULE_CACHE=1 this is a seconds-scale
-        # load vs minutes for position-replay warmup.  If we restore
-        # ANY entries, skip warmup entirely -- warmup's only purpose
-        # is to populate schedule_cache, and if the cache is already
-        # populated from disk, re-running dummy forwards adds nothing
-        # except GPU-work cost.
+        # load vs minutes for position-replay warmup.
+        #
+        # We STILL run warmup after restoring, because warmup's side
+        # effect -- triggering ``cuModuleLoadData`` + GPU upload for
+        # every unique kernel -- is a separate, per-process cost that
+        # neither cache.db nor schedule_cache persistence can eliminate.
+        # CUDA modules live in a process-local CUDA context; there's no
+        # CUDA API to serialise "loaded module on GPU" across processes.
+        # Without warmup, the first user request pays ~80-100ms per
+        # unique kernel on first touch (~300 kernels for Qwen3-8B =
+        # ~27 seconds).  With warmup those loads happen at startup and
+        # the first real request lands on an already-primed GPU.
         schedule_cache_restored = 0
         if self._schedule_cache_enabled:
             schedule_cache_restored = _load_schedule_cache_into_tinygrad(
@@ -325,8 +332,8 @@ class TinygradBackend(StepBackend):
             if schedule_cache_restored > 0:
                 print(
                     f"[egg schedule-cache] loaded {schedule_cache_restored} "
-                    f"entries from {self._schedule_cache_file}; skipping "
-                    f"warmup (cache already populated)",
+                    f"entries from {self._schedule_cache_file} (warmup "
+                    f"will still run to prime the CUDA module table)",
                     flush=True,
                 )
 
@@ -347,16 +354,16 @@ class TinygradBackend(StepBackend):
         #   full  -- warm every chunk-aligned position 0, CHUNK,
         #            2*CHUNK, ..., up to max_context.  Longest load
         #            (~minutes) but every real request is fast.
-        # Skip warmup if schedule_cache load covered it -- warmup's
-        # only value is populating schedule_cache, which just happened
-        # from disk.  Running it anyway would just be dummy GPU work
-        # for entries already cached.
-        if schedule_cache_restored > 0:
-            warmup_mode = "off"
-        else:
-            warmup_mode = os.environ.get("EGG_WARMUP", "first")
+        # Always run warmup as configured.  Even when schedule_cache
+        # was restored from disk, warmup's dummy forwards serve a
+        # different role: they trigger cuModuleLoadData + GPU upload
+        # for every unique kernel, which CAN'T be cached across
+        # processes.  Schedule_cache restoration + warmup together
+        # eliminate BOTH the scheduling cost (~125ms/layer) AND the
+        # module-load cost (~80-100ms/kernel) from the first user
+        # request.
         self._warmup(
-            mode=warmup_mode,
+            mode=os.environ.get("EGG_WARMUP", "first"),
             chunk_size=int(os.environ.get("EGG_PREFILL_CHUNK", "128")),
         )
 
