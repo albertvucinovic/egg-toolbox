@@ -59,41 +59,64 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Pin tinygrad's disk cache to a known path in the repo.  Without
-# this, systemd-run's transient --user scope can give the process a
-# different XDG_CACHE_HOME than the user's shell, so compiled kernels
-# land in one path on run N and are looked for in a different path on
-# run N+1 -- every request pays the BEAM compile cost, even though
-# the cache ostensibly "exists".  Pinning to $SCRIPT_DIR/.tinygrad-cache/
-# also keeps the cache reproducibly tied to this repo rather than to
-# a shared user cache that other tinygrad projects might evict.
-export TINYGRAD_CACHE_DIR="${TINYGRAD_CACHE_DIR:-$SCRIPT_DIR/.tinygrad-cache}"
-mkdir -p "$TINYGRAD_CACHE_DIR"
-export CACHEDB="${CACHEDB:-$TINYGRAD_CACHE_DIR/cache.db}"
+# Tinygrad's default kernel cache path is ~/.cache/tinygrad/cache.db
+# (via XDG_CACHE_HOME).  We let it use that default unless the user
+# already has a bigger cache somewhere we recognise -- in which case
+# we pick the bigger one so prior compile work isn't thrown away.
+# Candidates considered in order of preference:
+#   1. ``$CACHEDB``              -- user's explicit override, wins.
+#   2. ``~/.cache/tinygrad/cache.db``  -- tinygrad default, normal place.
+#   3. ``$SCRIPT_DIR/.tinygrad-cache/cache.db``  -- repo-local, from
+#      a brief experiment that pinned cache here.  Kept as a fallback
+#      source.
+# The candidate with the largest non-zero size wins; if all are empty
+# or missing, we use the tinygrad default.
+_size_of() { [[ -f "$1" ]] && stat -c '%s' "$1" || echo 0; }
+
+_default_cache="${XDG_CACHE_HOME:-$HOME/.cache}/tinygrad/cache.db"
+_repo_cache="$SCRIPT_DIR/.tinygrad-cache/cache.db"
+
+if [[ -n "${CACHEDB:-}" ]]; then
+  : # user explicit override, keep
+else
+  _default_size=$(_size_of "$_default_cache")
+  _repo_size=$(_size_of "$_repo_cache")
+  if (( _repo_size > _default_size )); then
+    export CACHEDB="$_repo_cache"
+  else
+    export CACHEDB="$_default_cache"
+  fi
+fi
+mkdir -p "$(dirname "$CACHEDB")"
+
 # CACHELEVEL=2 is the default but be explicit.  =0 disables the disk
 # cache entirely (don't use unless recovering from a corrupt cache.db).
 export CACHELEVEL="${CACHELEVEL:-2}"
 
 # Report cache state at startup so we can see definitively whether
 # the cache file exists and has data, before any kernel tries to
-# read from it.  If cache.db shows up at 0 bytes every run, tinygrad
-# wasn't flushing to disk on prior exits -- filing as a bug.
+# read from it.  Shows BOTH the default and the repo-local paths so
+# you can see if there's a cache hiding somewhere we're not using.
 echo "=== tinygrad kernel cache state ==="
-if [[ -f "$CACHEDB" ]]; then
-  size_bytes=$(stat -c '%s' "$CACHEDB")
-  mtime=$(stat -c '%y' "$CACHEDB")
-  printf '  path  : %s\n' "$CACHEDB"
-  printf '  size  : %s bytes\n' "$size_bytes"
-  printf '  mtime : %s\n' "$mtime"
-  # -wal / -shm files indicate an active or unclean SQLite write.
-  for suffix in -wal -shm; do
-    if [[ -f "${CACHEDB}${suffix}" ]]; then
-      s=$(stat -c '%s' "${CACHEDB}${suffix}")
-      printf '  %s : %s bytes\n' "${CACHEDB##*/}${suffix}" "$s"
-    fi
-  done
-else
-  printf '  path  : %s (does NOT exist -- first run, expect full BEAM compile)\n' "$CACHEDB"
+printf '  active path : %s\n' "$CACHEDB"
+for candidate in "$_default_cache" "$_repo_cache"; do
+  if [[ -f "$candidate" ]]; then
+    size_bytes=$(stat -c '%s' "$candidate")
+    mtime=$(stat -c '%y' "$candidate")
+    marker=""
+    [[ "$candidate" == "$CACHEDB" ]] && marker=" <-- using this one"
+    printf '  %-50s  %12s bytes  %s%s\n' \
+      "$candidate" "$size_bytes" "${mtime%%.*}" "$marker"
+    for suffix in -wal -shm; do
+      if [[ -f "${candidate}${suffix}" ]]; then
+        s=$(stat -c '%s' "${candidate}${suffix}")
+        printf '  %-50s  %12s bytes\n' "${candidate}${suffix}" "$s"
+      fi
+    done
+  fi
+done
+if [[ ! -f "$CACHEDB" ]]; then
+  echo "  (active cache does not exist yet -- first run, expect full BEAM compile)"
 fi
 echo "==================================="
 
@@ -116,7 +139,8 @@ export EGG_PREFILL_CHUNK="${EGG_PREFILL_CHUNK:-128}"
 exec systemd-run --scope --user -p CPUQuota=400% \
   --setenv=CACHEDB \
   --setenv=CACHELEVEL \
-  --setenv=TINYGRAD_CACHE_DIR \
+  --setenv=HOME \
+  --setenv=XDG_CACHE_HOME \
   --setenv=DEBUG \
   --setenv=JITBEAM \
   --setenv=BEAM_DEBUG \
