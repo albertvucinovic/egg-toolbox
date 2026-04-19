@@ -131,24 +131,32 @@ export EGG_DEBUG_PREFIX="${EGG_DEBUG_PREFIX:-1}"
 export EGG_DEBUG_MESSAGES="${EGG_DEBUG_MESSAGES:-1}"
 export EGG_PREFILL_CHUNK="${EGG_PREFILL_CHUNK:-128}"
 
-# Explicitly forward every env var we care about through systemd-run,
-# rather than relying on --scope's env inheritance (which is murky
-# under --user scopes -- we saw second-restart BEAM recompiles that
-# strongly suggest the child process was reading a different
-# XDG_CACHE_HOME than we set above).
+# Force Python's stdout/stderr unbuffered so tinygrad's DEBUG lines
+# and our EGG_* prints flush immediately rather than accumulating in
+# a pipe buffer.  Without this, running under systemd-run --scope
+# (which may not attach the child to a TTY) makes prints invisible
+# until a buffer fills -- looks like "nothing's happening" for minutes.
+export PYTHONUNBUFFERED=1
+
+# Explicitly forward env vars through systemd-run using the
+# ``--setenv=VAR=$VAR`` form rather than the bare ``--setenv=VAR``
+# form.  The bare form is supposed to propagate the current value but
+# has been observed to be inconsistent across systemd versions / under
+# --user scopes.  Explicit ``=VAR=value`` is unambiguous.
 exec systemd-run --scope --user -p CPUQuota=400% \
-  --setenv=CACHEDB \
-  --setenv=CACHELEVEL \
-  --setenv=HOME \
-  --setenv=XDG_CACHE_HOME \
-  --setenv=DEBUG \
-  --setenv=JITBEAM \
-  --setenv=BEAM_DEBUG \
-  --setenv=EGG_LOG_FORWARD \
-  --setenv=EGG_DEBUG_PREFIX \
-  --setenv=EGG_DEBUG_MESSAGES \
-  --setenv=EGG_PREFILL_CHUNK \
-  "$SCRIPT_DIR/.venv/bin/python" -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
+  --setenv="CACHEDB=$CACHEDB" \
+  --setenv="CACHELEVEL=$CACHELEVEL" \
+  --setenv="HOME=$HOME" \
+  --setenv="XDG_CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}" \
+  --setenv="DEBUG=$DEBUG" \
+  --setenv="JITBEAM=$JITBEAM" \
+  --setenv="BEAM_DEBUG=$BEAM_DEBUG" \
+  --setenv="EGG_LOG_FORWARD=$EGG_LOG_FORWARD" \
+  --setenv="EGG_DEBUG_PREFIX=$EGG_DEBUG_PREFIX" \
+  --setenv="EGG_DEBUG_MESSAGES=$EGG_DEBUG_MESSAGES" \
+  --setenv="EGG_PREFILL_CHUNK=$EGG_PREFILL_CHUNK" \
+  --setenv="PYTHONUNBUFFERED=$PYTHONUNBUFFERED" \
+  "$SCRIPT_DIR/.venv/bin/python" -u -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
   --backend tinygrad \
   --host 127.0.0.1 --port 8765 \
   --context-length 8196 \
