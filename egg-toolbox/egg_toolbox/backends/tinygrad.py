@@ -382,18 +382,69 @@ class TinygradBackend(StepBackend):
         v_start_pos = UOp.variable("start_pos", 1, model.max_context - 1)
         use_sym = bool(getenv("SYM", 1))
 
+        # Annotated per-forward log.  ``EGG_LOG_FORWARD=1`` prints one
+        # line per model() call with purpose + shape + elapsed time,
+        # so you can correlate tinygrad's ``CACHE MISS <hash>`` /
+        # ``CACHE HIT <hash>`` lines (which don't say what they're
+        # caching) with the egg-toolbox operation that triggered them.
+        # Also prints a one-line summary at the end of each request
+        # with aggregate counts and timings.
+        log_forward = os.environ.get("EGG_LOG_FORWARD", "0") != "0"
+        # Per-request counters, populated if log_forward is on.
+        fwd_stats = {
+            "chunks": 0, "residuals": 0, "decodes": 0,
+            "chunk_ms": 0.0, "residual_ms": 0.0, "decode_ms": 0.0,
+            "slowest": (0.0, ""),  # (ms, label)
+        }
+
+        def _call(label: str, t, sp):
+            """Call model() with optional annotated logging.  ``label``
+            is a short tag like ``chunk @ 128`` for the log line.
+            Captures wall-clock so you see which calls pay a compile
+            (the first of a given shape will be much slower than the
+            rest)."""
+            import time as _time
+            if not log_forward:
+                return model(t, sp)
+            sp_disp = (
+                sp if isinstance(sp, int)
+                else getattr(sp, "_bound_value", "UOp(?)")
+            )
+            T = t.shape[1]
+            t0 = _time.monotonic()
+            out = model(t, sp)
+            elapsed_ms = (_time.monotonic() - t0) * 1000.0
+            print(
+                f"[egg forward] {label} T={T} start_pos={sp_disp} "
+                f"{elapsed_ms:7.1f}ms",
+                flush=True,
+            )
+            # Track slowest for the summary line.
+            if elapsed_ms > fwd_stats["slowest"][0]:
+                fwd_stats["slowest"] = (elapsed_ms, f"{label} T={T} sp={sp_disp}")
+            if label.startswith("chunk"):
+                fwd_stats["chunks"] += 1
+                fwd_stats["chunk_ms"] += elapsed_ms
+            elif label.startswith("residual"):
+                fwd_stats["residuals"] += 1
+                fwd_stats["residual_ms"] += elapsed_ms
+            elif label.startswith("decode"):
+                fwd_stats["decodes"] += 1
+                fwd_stats["decode_ms"] += elapsed_ms
+            return out
+
         # Helper: run one T=1 forward via the JITted decode kernel.
         # UOp-bound start_pos (for sp_int>=1) lets tinygrad reuse the
         # same compiled kernel across every decode position.
         # Falls back to an int for pos=0 because the UOp's declared
         # range is [1, max_context-1).
-        def _forward_t1(tok: int, sp_int: int):
+        def _forward_t1(tok: int, sp_int: int, label: str):
             t = Tensor([[tok]], dtype="int32")
             if use_sym and sp_int >= 1:
                 sp = v_start_pos.bind(sp_int)
             else:
                 sp = sp_int
-            return model(t, sp)
+            return _call(label, t, sp)
 
         # Helper: run one forward with T>1 (chunk prefill).
         # MUST use an int start_pos because tinygrad's TransformerBlock
@@ -407,61 +458,49 @@ class TinygradBackend(StepBackend):
         # after first compile -- still a big win over the pre-chunking
         # behaviour where every unique prompt length T triggered a
         # fresh BEAM compile.
-        def _forward_chunk(chunk_tokens: list[int], sp_int: int):
+        def _forward_chunk(chunk_tokens: list[int], sp_int: int, label: str):
             t = Tensor([chunk_tokens], dtype="int32")
-            return model(t, sp_int)
+            return _call(label, t, sp_int)
 
         feed_pos = cp
         end_pos = len(prompt_list)
         logits = None
 
-        if chunk_size > 0:
-            while feed_pos + chunk_size <= end_pos:
-                chunk = list(prompt_list[feed_pos:feed_pos + chunk_size])
-                logits = _forward_chunk(chunk, feed_pos)
-                feed_pos += chunk_size
+        # Wrap the prefill + decode in try/finally so the one-line
+        # per-request summary fires on any exit -- normal completion,
+        # caller break (GeneratorExit at yield), or exception.
+        # The summary reports aggregate counts and timings so the user
+        # doesn't have to scroll through the per-call log to see what
+        # the request did overall.
+        try:
+            if chunk_size > 0:
+                while feed_pos + chunk_size <= end_pos:
+                    chunk = list(prompt_list[feed_pos:feed_pos + chunk_size])
+                    logits = _forward_chunk(chunk, feed_pos, f"chunk @ {feed_pos}")
+                    feed_pos += chunk_size
 
-            # Residual (< chunk_size tokens) via T=1 each.  This path
-            # hits the T=1 decode kernel, which is also reused across
-            # all requests.
-            while feed_pos < end_pos:
-                logits = _forward_t1(prompt_list[feed_pos], feed_pos)
-                feed_pos += 1
-        else:
-            # Unchunked fallback: single large prefill at int start_pos.
-            logits = _forward_chunk(list(prompt_list[cp:]), cp)
-            feed_pos = end_pos
+                # Residual (< chunk_size tokens) via T=1 each.  This
+                # path hits the T=1 decode kernel, which is also
+                # reused across all requests.
+                while feed_pos < end_pos:
+                    logits = _forward_t1(
+                        prompt_list[feed_pos], feed_pos,
+                        f"residual @ {feed_pos}",
+                    )
+                    feed_pos += 1
+            else:
+                # Unchunked fallback: single large prefill at int
+                # start_pos.
+                logits = _forward_chunk(
+                    list(prompt_list[cp:]), cp, f"full prefill @ {cp}",
+                )
+                feed_pos = end_pos
 
-        assert logits is not None, "prefill produced no logits -- suffix length was 0?"
-        # cache_kv[0:end_pos) now reflects prompt_list exactly.
-        self._cache_tokens = list(prompt_list)
-        next_id = sample_next_token(
-            np.asarray(logits.tolist()[0], dtype=np.float32),
-            request.sampling,
-            rng,
-            recent_tokens=recent,
-        )
-        _record_seen(next_id)
-        yield next_id
-
-        # --- Decode loop. -------------------------------------------
-        # T = 1 with UOp-bound start_pos: hits the JITted kernel, which
-        # persists across requests because start_pos is symbolic.  We
-        # intentionally do NOT call forward_jit.reset().
-        pos = len(prompt_list)
-        max_ctx = model.max_context
-        while pos < max_ctx:
-            if cancelled.is_set():
-                break
-            t = Tensor([[next_id]], dtype="int32")
-            sp = v_start_pos.bind(pos) if use_sym else pos
-            logits = model(t, sp)
-            # We've just fed `next_id` at cache position `pos`.  The
-            # assign in _attention writes cache_kv[pos:pos+1), and the
-            # resident-tokens list must grow in lockstep so that if a
-            # cancel arrives right now, the invariant still holds.
-            self._cache_tokens.append(next_id)
-            pos += 1
+            assert logits is not None, (
+                "prefill produced no logits -- suffix length was 0?"
+            )
+            # cache_kv[0:end_pos) now reflects prompt_list exactly.
+            self._cache_tokens = list(prompt_list)
             next_id = sample_next_token(
                 np.asarray(logits.tolist()[0], dtype=np.float32),
                 request.sampling,
@@ -470,6 +509,58 @@ class TinygradBackend(StepBackend):
             )
             _record_seen(next_id)
             yield next_id
+
+            # --- Decode loop. ---------------------------------------
+            # T = 1 with UOp-bound start_pos: hits the JITted kernel,
+            # which persists across requests because start_pos is
+            # symbolic.  We intentionally do NOT call
+            # forward_jit.reset().
+            pos = len(prompt_list)
+            max_ctx = model.max_context
+            while pos < max_ctx:
+                if cancelled.is_set():
+                    break
+                t = Tensor([[next_id]], dtype="int32")
+                sp = v_start_pos.bind(pos) if use_sym else pos
+                logits = (
+                    _call(f"decode @ {pos}", t, sp)
+                    if log_forward else model(t, sp)
+                )
+                # We've just fed `next_id` at cache position `pos`.
+                # The assign in _attention writes cache_kv[pos:pos+1),
+                # and the resident-tokens list must grow in lockstep
+                # so that if a cancel arrives right now, the invariant
+                # still holds.
+                self._cache_tokens.append(next_id)
+                pos += 1
+                next_id = sample_next_token(
+                    np.asarray(logits.tolist()[0], dtype=np.float32),
+                    request.sampling,
+                    rng,
+                    recent_tokens=recent,
+                )
+                _record_seen(next_id)
+                yield next_id
+        finally:
+            if log_forward:
+                s = fwd_stats
+                total_fwd = s["chunks"] + s["residuals"] + s["decodes"]
+                total_ms = s["chunk_ms"] + s["residual_ms"] + s["decode_ms"]
+                avg_decode = (
+                    s["decode_ms"] / s["decodes"]
+                    if s["decodes"] else 0.0
+                )
+                slow_ms, slow_label = s["slowest"]
+                print(
+                    f"[egg forward] request summary: "
+                    f"chunks={s['chunks']}({s['chunk_ms']:.0f}ms) "
+                    f"residuals={s['residuals']}({s['residual_ms']:.0f}ms) "
+                    f"decode={s['decodes']}tok({s['decode_ms']:.0f}ms, "
+                    f"avg {avg_decode:.1f}ms/tok) "
+                    f"total={total_fwd}calls/{total_ms:.0f}ms; "
+                    f"slowest={slow_ms:.0f}ms ({slow_label})",
+                    flush=True,
+                )
 
     def model_name(self) -> str:
         return self._model_name_str
