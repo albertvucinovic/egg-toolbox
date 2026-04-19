@@ -131,6 +131,122 @@ class TinygradBackend(StepBackend):
 
         self._tokenizer = TinygradTokenizer(tokenizer, eos_id=eos_id, bos_id=bos_id)
 
+        # Kernel warmup.  Each unique (shape, start_pos) forward triggers
+        # a fresh schedule pass the first time it's seen in a Python
+        # process (tinygrad's schedule_cache is in-memory only and not
+        # persisted to cache.db).  At chunk_size=128 on Qwen3-8B this
+        # costs ~4s of scheduling plus ~8s of GPU work per chunk
+        # position, paid at the time the user's request hits.  We move
+        # that cost to load time by pre-running dummy forwards here.
+        #
+        # EGG_WARMUP modes:
+        #   off   -- skip warmup entirely (fastest load, slow first
+        #            request)
+        #   first -- warm one chunk @ 0 + one T=1 decode (default;
+        #            ~12s added to load, first chunk position is
+        #            pre-cached but other positions still pay)
+        #   full  -- warm every chunk-aligned position 0, CHUNK,
+        #            2*CHUNK, ..., up to max_context.  Longest load
+        #            (~minutes) but every real request is fast.
+        self._warmup(
+            mode=os.environ.get("EGG_WARMUP", "first"),
+            chunk_size=int(os.environ.get("EGG_PREFILL_CHUNK", "128")),
+        )
+
+    def _warmup(self, mode: str, chunk_size: int) -> None:
+        """Populate tinygrad's in-memory schedule_cache so the first
+        real request doesn't pay per-chunk-position scheduling cost."""
+        import time as _time
+        from tinygrad import Tensor, UOp
+
+        if mode == "off":
+            return
+
+        if self._model is None:  # defensive -- load_model() sets it
+            return
+
+        max_ctx = self._model.max_context
+        if mode == "first":
+            positions = [0]
+        elif mode == "full":
+            # Stop before max_context so we never bind a cache position
+            # out of range.  Chunk kernels are keyed on int start_pos,
+            # so each position is a distinct schedule.
+            positions = list(range(0, max_ctx - chunk_size, chunk_size))
+        else:
+            print(
+                f"[egg warmup] unknown EGG_WARMUP={mode!r}, "
+                f"accepted: off, first, full.  Skipping.",
+                flush=True,
+            )
+            return
+
+        print(
+            f"[egg warmup] mode={mode} chunk_size={chunk_size} "
+            f"positions={len(positions)}; "
+            f"pre-running dummy forwards to populate schedule_cache.  "
+            f"Cold cache.db = many minutes; warm cache.db = seconds "
+            f"per position.",
+            flush=True,
+        )
+
+        t_total = _time.monotonic()
+        dummy_chunk = [0] * chunk_size
+        dummy_decode = 0
+
+        # Chunk kernels (T = chunk_size, int start_pos).
+        for i, pos in enumerate(positions):
+            t = Tensor([dummy_chunk], dtype="int32")
+            t0 = _time.monotonic()
+            try:
+                _ = self._model(t, pos)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[egg warmup] chunk @ {pos} FAILED: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                continue
+            elapsed = _time.monotonic() - t0
+            print(
+                f"[egg warmup]   [{i + 1:3d}/{len(positions)}] "
+                f"chunk @ {pos:5d} T={chunk_size}  {elapsed:6.2f}s",
+                flush=True,
+            )
+
+        # T=1 decode kernel (UOp-bound start_pos).  Only needs one
+        # warmup because the same kernel serves every decode step.
+        v_sp = UOp.variable("start_pos", 1, max_ctx - 1)
+        t = Tensor([[dummy_decode]], dtype="int32")
+        t0 = _time.monotonic()
+        try:
+            _ = self._model(t, v_sp.bind(1))
+            elapsed = _time.monotonic() - t0
+            print(
+                f"[egg warmup]   T=1 decode @ 1  {elapsed:6.2f}s",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[egg warmup] T=1 decode FAILED: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+        # Reset _cache_tokens -- dummy forwards above wrote garbage
+        # K/V into cache_kv[0:chunk_size * N], but that doesn't matter
+        # because the first real request matches against an empty
+        # _cache_tokens (cp=0) and rewrites those positions anyway.
+        # Being explicit about it keeps the prefix-cache invariant
+        # (``_cache_tokens reflects the ordered tokens currently
+        # resident in cache_kv[0:len(_cache_tokens))``) trivially true:
+        # we assert nothing is resident post-warmup.
+        self._cache_tokens = []
+        print(
+            f"[egg warmup] done in {_time.monotonic() - t_total:.1f}s",
+            flush=True,
+        )
+
     def tokenizer(self) -> Tokenizer:
         assert self._tokenizer is not None, "Model not loaded"
         return self._tokenizer

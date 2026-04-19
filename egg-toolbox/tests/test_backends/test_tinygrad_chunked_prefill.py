@@ -285,6 +285,98 @@ class TestChunkedPrefillStartPosTyping:
         assert result == [42], result
 
 
+class TestWarmup:
+    """``EGG_WARMUP=mode`` pre-populates tinygrad's in-memory
+    schedule_cache at model-load time by firing dummy forwards.
+
+    These tests exercise ``TinygradBackend._warmup`` directly with a
+    fake model.  The fake records every ``(T, start_pos)`` pair it
+    sees, so we can check the warmup shape contract without touching
+    a real GPU."""
+
+    def test_off_fires_no_forwards(self, monkeypatch):
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+        backend._warmup(mode="off", chunk_size=128)
+        assert fake.calls == []
+
+    def test_first_fires_one_chunk_and_one_decode(self, monkeypatch):
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+        backend._warmup(mode="first", chunk_size=128)
+        # One chunk @ 0, one T=1 decode @ 1 (UOp bound to 1).
+        assert fake.calls == [(128, 0), (1, 1)], fake.calls
+
+    def test_full_fires_one_chunk_per_aligned_position(self, monkeypatch):
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+        backend._warmup(mode="full", chunk_size=128)
+        # positions = range(0, 512 - 128, 128) = [0, 128, 256] (three chunks)
+        # plus one T=1 decode.
+        assert fake.calls == [
+            (128, 0), (128, 128), (128, 256), (1, 1),
+        ], fake.calls
+
+    def test_full_custom_chunk_size(self, monkeypatch):
+        fake = _FakeModel(script=[0], max_context=300)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+        backend._warmup(mode="full", chunk_size=64)
+        # positions = range(0, 300-64, 64) = [0, 64, 128, 192] (four chunks)
+        # plus one T=1 decode.
+        assert fake.calls == [
+            (64, 0), (64, 64), (64, 128), (64, 192), (1, 1),
+        ], fake.calls
+
+    def test_unknown_mode_is_noop(self, monkeypatch, capsys):
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+        backend._warmup(mode="bogus", chunk_size=128)
+        assert fake.calls == []
+        captured = capsys.readouterr()
+        assert "unknown EGG_WARMUP" in captured.out
+
+    def test_failing_chunk_does_not_abort_warmup(self, monkeypatch, capsys):
+        """A chunk forward that raises (e.g., tinygrad dependency bug)
+        should log and continue with remaining positions -- we don't
+        want one broken kernel to block load entirely."""
+
+        class _FlakyModel(_FakeModel):
+            def __call__(self_inner, t, start_pos):
+                sp_int = (
+                    start_pos if isinstance(start_pos, int)
+                    else getattr(start_pos, "_bound_value", -1)
+                )
+                if t.shape[1] > 1 and sp_int == 128:
+                    raise RuntimeError("simulated GPU failure at chunk @ 128")
+                return super().__call__(t, start_pos)
+
+        fake = _FlakyModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+        backend._warmup(mode="full", chunk_size=128)
+        # [(128, 0), FAILED, (128, 256), (1, 1)]
+        assert (128, 0) in fake.calls
+        assert (128, 256) in fake.calls
+        assert (1, 1) in fake.calls
+        captured = capsys.readouterr()
+        assert "chunk @ 128 FAILED" in captured.out
+
+    def test_warmup_does_not_poison_prefix_cache(self, monkeypatch):
+        """After warmup, ``_cache_tokens`` must be empty so the first
+        real request does a full prefill from cp=0 rather than matching
+        against stale dummy tokens."""
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        backend._cache_tokens = [999, 999, 999]  # pretend some state
+        backend._warmup(mode="full", chunk_size=128)
+        assert backend._cache_tokens == []
+
+
 class TestChunkedPrefillCorrectness:
     def test_first_yielded_token_comes_from_last_prefill_logits(self, monkeypatch):
         """The token we yield FIRST after prefill must be the sampled
