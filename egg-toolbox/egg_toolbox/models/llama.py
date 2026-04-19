@@ -69,13 +69,16 @@ class LlamaArchitecture(Architecture):
             for block in self.blk:
                 patch_block_attention(block, max_context=self.max_context)
 
-        # Build the JIT once at construction time with our logits-returning
-        # forward.  tinygrad's Transformer builds its own ``forward_jit``
-        # over the argmax-folded forward; we replace it so the backend's
-        # decode-path kernel compiles against ``_forward_logits``.
+        # Build JITs once at construction time.  tinygrad's TinyJit
+        # captures ONE trace per instance (shape mismatches raise
+        # ``JitError``), so we keep a SEPARATE TinyJit per (T value)
+        # we need to accelerate: one for T=1 decode, one for T=chunk
+        # prefill.  Both wrap the same ``_forward_logits`` but each
+        # caches its own compiled graph.
         from tinygrad import TinyJit
 
-        self.forward_jit = TinyJit(self._forward_logits)
+        self.forward_jit = TinyJit(self._forward_logits)        # T=1 decode
+        self.forward_jit_chunk = TinyJit(self._forward_logits)  # T=chunk
 
     def _forward_logits(self, tokens: "Tensor", start_pos: "int | UOp") -> "Tensor":
         x = self.token_embd(tokens)
@@ -96,12 +99,18 @@ class LlamaArchitecture(Architecture):
         we've patched each block's ``_attention`` to use an arange-
         based mask instead, so T>1 with UOp start_pos also works --
         one symbolic JIT trace covers every chunk position.
+
+        Two JITs because TinyJit captures ONE trace per instance and
+        raises ``JitError`` on shape mismatch: ``forward_jit`` for
+        T=1 decode, ``forward_jit_chunk`` for T>1 chunks.
         """
         from tinygrad import UOp, getenv
 
         if getenv("JIT", 1) and isinstance(start_pos, UOp):
-            if tokens.shape[1] == 1 or self._jit_chunks:
+            if tokens.shape[1] == 1:
                 return self.forward_jit(tokens, start_pos)
+            elif self._jit_chunks:
+                return self.forward_jit_chunk(tokens, start_pos)
         return self._forward_logits(tokens, start_pos)
 
     @classmethod
