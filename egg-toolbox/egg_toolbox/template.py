@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import struct
 from datetime import datetime
 from pathlib import Path
@@ -12,10 +14,58 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from .types import ChatMessage, ContentPart, Tool, ToolCall, ToolCallFunction
 
 
+# Qwen3's baked chat template deliberately strips <think>...</think>
+# from non-last assistant messages -- it gates the render behind
+# ``loop.index0 > ns.last_query_index``, which is only true for the
+# LAST assistant message in the history (or the in-flight response).
+# That matches Qwen3's training distribution (past thinking stripped)
+# but means multi-turn chat always mismatches at the assistant-turn
+# boundary: the previous turn's cache has ``<|im_start|>assistant\n
+# <think>...</think>`` but the replayed history has
+# ``<|im_start|>assistant\n`` + content directly, so the prefix cache
+# evicts at exactly the token after "\n".  When
+# EGG_PRESERVE_HISTORY_THINKING=1 we rewrite the gate to an
+# always-true check so historical assistant messages render their
+# thinking block.  Trade-off: better prefix cache + model sees its own
+# prior CoT, but the rendered history goes slightly out-of-distribution
+# relative to what Qwen3 saw in training.  Opt-in, not default.
+_QWEN3_THINK_GATE_RE = re.compile(
+    r"\{%-\s*if\s+loop\.index0\s*>\s*ns\.last_query_index\s*%\}",
+)
+
+
+def _patch_preserve_history_thinking(template_source: str) -> str:
+    """Return a variant of ``template_source`` with Qwen3's history-thinking
+    gate neutralised.  No-op on templates that don't have the gate."""
+    return _QWEN3_THINK_GATE_RE.sub(
+        "{%- if reasoning_content %}",
+        template_source,
+    )
+
+
 class ChatTemplate:
     """Loads and renders a model's Jinja2 chat template."""
 
-    def __init__(self, template_str: str, bos_token: str = "", eos_token: str = ""):
+    def __init__(
+        self,
+        template_str: str,
+        bos_token: str = "",
+        eos_token: str = "",
+        *,
+        preserve_history_thinking: bool | None = None,
+    ):
+        # Opt-in: rewrite Qwen3-style "strip past thinking" gates so
+        # multi-turn conversations retain their prior <think>...</think>
+        # blocks in rendered history.  Off by default to match what
+        # Qwen3 was trained on.  Accepts a default-from-env:
+        # ``EGG_PRESERVE_HISTORY_THINKING=1`` when the flag isn't
+        # passed explicitly.
+        if preserve_history_thinking is None:
+            preserve_history_thinking = (
+                os.environ.get("EGG_PRESERVE_HISTORY_THINKING", "0") != "0"
+            )
+        if preserve_history_thinking:
+            template_str = _patch_preserve_history_thinking(template_str)
         self.source = template_str
         self.bos_token = bos_token
         self.eos_token = eos_token
