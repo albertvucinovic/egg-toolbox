@@ -53,6 +53,22 @@ class LlamaArchitecture(Architecture):
         self.output = transformer.output
         self.max_context = transformer.max_context
 
+        # Opt-in: patch each block's ``_attention`` with a symbolic-
+        # friendly causal mask so T>1 forwards with UOp start_pos
+        # become JIT-eligible (tinygrad upstream gates T>1 on int
+        # start_pos because ``triu`` rejects symbolic shapes).  With
+        # EGG_JIT_CHUNKS=1, chunked-prefill submits every chunk via
+        # the JITted graph: ~680 per-kernel Python dispatches per
+        # chunk collapse into one graph submission, ~8s -> ~400ms.
+        # Off by default while we measure stability; see
+        # egg_toolbox/models/symbolic_attention.py for the risks.
+        import os as _os
+        self._jit_chunks = _os.environ.get("EGG_JIT_CHUNKS", "0") != "0"
+        if self._jit_chunks:
+            from .symbolic_attention import patch_block_attention
+            for block in self.blk:
+                patch_block_attention(block, max_context=self.max_context)
+
         # Build the JIT once at construction time with our logits-returning
         # forward.  tinygrad's Transformer builds its own ``forward_jit``
         # over the argmax-folded forward; we replace it so the backend's
@@ -72,11 +88,20 @@ class LlamaArchitecture(Architecture):
         return self._forward_logits(tokens, start_pos)
 
     def __call__(self, tokens: "Tensor", start_pos: "int | UOp" = 0) -> "Tensor":
-        """Decode (T=1, UOp start_pos) takes the JIT; everything else eager."""
+        """JIT when start_pos is a UOp, eager otherwise.
+
+        Upstream tinygrad additionally gates on ``tokens.shape[1] == 1``
+        because its ``_attention`` uses ``triu`` for the causal mask,
+        which rejects symbolic shape dims.  When ``EGG_JIT_CHUNKS=1``
+        we've patched each block's ``_attention`` to use an arange-
+        based mask instead, so T>1 with UOp start_pos also works --
+        one symbolic JIT trace covers every chunk position.
+        """
         from tinygrad import UOp, getenv
 
-        if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp):
-            return self.forward_jit(tokens, start_pos)
+        if getenv("JIT", 1) and isinstance(start_pos, UOp):
+            if tokens.shape[1] == 1 or self._jit_chunks:
+                return self.forward_jit(tokens, start_pos)
         return self._forward_logits(tokens, start_pos)
 
     @classmethod

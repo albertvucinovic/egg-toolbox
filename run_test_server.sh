@@ -40,6 +40,21 @@
 #                           =0 disables chunking (single-shot prefill,
 #                           slower on novel T values because kernels
 #                           recompile).
+#   EGG_JIT_CHUNKS=1        EXPERIMENTAL: make T>1 prefill chunks
+#                           JIT-eligible via a symbolic-friendly
+#                           causal mask (arange+where replaces triu,
+#                           which rejects symbolic shape dims).  When
+#                           enabled: ONE symbolic JIT trace covers
+#                           every chunk position, ~680 per-kernel
+#                           Python dispatches per chunk collapse into
+#                           one submission, and the unique-kernel
+#                           count drops from ~300 to ~100 (big impact
+#                           on first-process module-load cost too).
+#                           Opt-in because it patches tinygrad
+#                           internals; see workspace-0j8 brittleness
+#                           report.  Fallback on any failure: disable
+#                           this flag.  Expected chunk time: ~400ms
+#                           (GPU-bound floor) instead of ~8s.
 #   EGG_SCHEDULE_CACHE=1    EXPERIMENTAL: persist tinygrad's actual
 #                           schedule_cache dict to disk and reload on
 #                           startup.  Near-instant scheduling on
@@ -171,6 +186,11 @@ export EGG_WARMUP="${EGG_WARMUP:-persisted}"
 # format, the load step logs and discards silently and we fall back
 # to position-replay.
 export EGG_SCHEDULE_CACHE="${EGG_SCHEDULE_CACHE:-1}"
+# Experimental: JIT-eligible T>1 prefill chunks via symbolic-mask
+# attention.  Patches each TransformerBlock's _attention method to
+# use arange+where instead of triu.  Default 1 to try it; revert to
+# 0 if something's broken at startup or first chunk forward.
+export EGG_JIT_CHUNKS="${EGG_JIT_CHUNKS:-1}"
 
 # Force Python's stdout/stderr unbuffered so tinygrad's DEBUG lines
 # and our EGG_* prints flush immediately rather than accumulating in
@@ -198,6 +218,7 @@ exec systemd-run --scope --user -p CPUQuota=400% \
   --setenv="EGG_PREFILL_CHUNK=$EGG_PREFILL_CHUNK" \
   --setenv="EGG_WARMUP=$EGG_WARMUP" \
   --setenv="EGG_SCHEDULE_CACHE=$EGG_SCHEDULE_CACHE" \
+  --setenv="EGG_JIT_CHUNKS=$EGG_JIT_CHUNKS" \
   --setenv="PYTHONUNBUFFERED=$PYTHONUNBUFFERED" \
   "$SCRIPT_DIR/.venv/bin/python" -u -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
   --backend tinygrad \

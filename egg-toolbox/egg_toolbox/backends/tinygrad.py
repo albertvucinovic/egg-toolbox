@@ -432,25 +432,56 @@ class TinygradBackend(StepBackend):
         dummy_chunk = [0] * chunk_size
         dummy_decode = 0
 
-        # Chunk kernels (T = chunk_size, int start_pos).
-        for i, pos in enumerate(positions):
+        # Match the runtime chunk-start-pos convention: with
+        # EGG_JIT_CHUNKS=1 chunks pass UOp-bound start_pos so one
+        # symbolic JIT trace covers all positions.  We warm at pos=1
+        # (UOp range starts at 1) so the JIT trace is populated; real
+        # requests at any chunk-aligned position then hit the same
+        # trace.  Without the flag we warm at each int position, same
+        # as before.
+        jit_chunks = os.environ.get("EGG_JIT_CHUNKS", "0") != "0"
+        v_sp_warmup = UOp.variable("start_pos", 1, self._model.max_context - 1)
+
+        # Chunk kernels.
+        if jit_chunks:
+            # One symbolic warmup covers all positions under JIT.
             t = Tensor([dummy_chunk], dtype="int32")
             t0 = _time.monotonic()
             try:
-                _ = self._model(t, pos)
+                _ = self._model(t, v_sp_warmup.bind(1))
             except Exception as exc:  # noqa: BLE001
                 print(
-                    f"[egg warmup] chunk @ {pos} FAILED: "
+                    f"[egg warmup] symbolic chunk FAILED: "
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
-                continue
-            elapsed = _time.monotonic() - t0
-            print(
-                f"[egg warmup]   [{i + 1:3d}/{len(positions)}] "
-                f"chunk @ {pos:5d} T={chunk_size}  {elapsed:6.2f}s",
-                flush=True,
-            )
+            else:
+                elapsed = _time.monotonic() - t0
+                print(
+                    f"[egg warmup]   symbolic chunk T={chunk_size} "
+                    f"(UOp start_pos)  {elapsed:6.2f}s",
+                    flush=True,
+                )
+        else:
+            # One int-start_pos warmup per requested position.
+            for i, pos in enumerate(positions):
+                t = Tensor([dummy_chunk], dtype="int32")
+                t0 = _time.monotonic()
+                try:
+                    _ = self._model(t, pos)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"[egg warmup] chunk @ {pos} FAILED: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    continue
+                elapsed = _time.monotonic() - t0
+                print(
+                    f"[egg warmup]   [{i + 1:3d}/{len(positions)}] "
+                    f"chunk @ {pos:5d} T={chunk_size}  {elapsed:6.2f}s",
+                    flush=True,
+                )
 
         # T=1 decode kernel (UOp-bound start_pos).  Only needs one
         # warmup because the same kernel serves every decode step.
@@ -801,23 +832,36 @@ class TinygradBackend(StepBackend):
             return _call(label, t, sp)
 
         # Helper: run one forward with T>1 (chunk prefill).
-        # MUST use an int start_pos because tinygrad's TransformerBlock
-        # constructs the causal mask via ``triu(start_pos+1)`` over a
-        # shape of ``(1, 1, T, start_pos+T)``, and ``triu`` asserts
-        # that the shape dims are plain ints (see tensor.py::_tri).
-        # A UOp start_pos here raises "does not support symbolic".
-        # We accept the tradeoff: each unique chunk start position
-        # compiles its own kernel (up to max_context/chunk_size
-        # distinct kernels, ~64 for default settings), all disk-cached
-        # after first compile -- still a big win over the pre-chunking
-        # behaviour where every unique prompt length T triggered a
-        # fresh BEAM compile.
+        #
+        # Default path: int start_pos.  tinygrad's upstream
+        # TransformerBlock builds the causal mask via
+        # ``triu(start_pos+1)`` over shape ``(1, 1, T, start_pos+T)``,
+        # and triu calls ``_tri`` which asserts shape dims are plain
+        # ints -- a UOp start_pos here raises "does not support
+        # symbolic".  Using int start_pos means every unique chunk
+        # position compiles its own kernel (~N_positions variants,
+        # ~300 kernels for max_context=8196 at chunk=128).
+        #
+        # EGG_JIT_CHUNKS=1 path: symbolic UOp start_pos.  We've
+        # patched each TransformerBlock's ``_attention`` (see
+        # egg_toolbox/models/symbolic_attention.py) to build the mask
+        # via arange+where instead of triu, which accepts symbolic
+        # dims.  One JIT trace then covers every chunk position;
+        # ~680 per-kernel Python dispatches per chunk collapse into
+        # one ``cuLaunchGraph``-scale submission (~8s -> ~400ms
+        # per chunk on Qwen3-8B at keep_packed).
+        jit_chunks = os.environ.get("EGG_JIT_CHUNKS", "0") != "0"
+
         def _forward_chunk(chunk_tokens: list[int], sp_int: int, label: str):
             # Record each position we actually use so the ``persisted``
             # warmup mode can replay exactly these on next startup.
             self._used_chunk_positions.add(sp_int)
             t = Tensor([chunk_tokens], dtype="int32")
-            return _call(label, t, sp_int)
+            if jit_chunks and use_sym and sp_int >= 1:
+                sp: Any = v_start_pos.bind(sp_int)
+            else:
+                sp = sp_int
+            return _call(label, t, sp)
 
         feed_pos = cp
         end_pos = len(prompt_list)
