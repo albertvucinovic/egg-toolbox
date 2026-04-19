@@ -140,3 +140,35 @@ def test_save_empty_cache_does_not_create_file(tmp_path):
     path = str(tmp_path / "never-created.pkl")
     _save_schedule_cache_from_tinygrad(path)
     assert not os.path.exists(path)
+
+
+def test_load_returns_count_of_new_entries(tmp_path):
+    """The load helper returns the number of entries it actually
+    added to schedule_cache -- used by _do_load_model to decide
+    whether to skip warmup (we only skip if the load populated
+    something)."""
+    from tinygrad import Tensor
+    from egg_toolbox.backends.tinygrad import (
+        _load_schedule_cache_into_tinygrad,
+        _save_schedule_cache_from_tinygrad,
+    )
+
+    sc = _with_clean_cache()
+    # Populate + save + clear.
+    (Tensor([1.0, 2.0, 3.0]) * 2).realize()
+    initial = len(sc)
+    assert initial >= 1
+    cache_path = str(tmp_path / "sc.pkl")
+    _save_schedule_cache_from_tinygrad(cache_path)
+    sc.clear()
+
+    # Load into empty cache -- returns entry count.
+    n = _load_schedule_cache_into_tinygrad(cache_path)
+    assert n == initial
+    assert len(sc) == initial
+
+    # Second load -- entries already present, returns 0 (no NEW
+    # entries added).  This is the signal _do_load_model uses.
+    n2 = _load_schedule_cache_into_tinygrad(cache_path)
+    assert n2 == 0
+    assert len(sc) == initial

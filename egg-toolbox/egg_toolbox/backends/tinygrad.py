@@ -312,13 +312,21 @@ class TinygradBackend(StepBackend):
         # Restore tinygrad's schedule_cache from disk before warmup so
         # positions we've seen in prior runs don't re-run the schedule
         # pass.  Under EGG_SCHEDULE_CACHE=1 this is a seconds-scale
-        # load vs minutes for position-replay warmup.
+        # load vs minutes for position-replay warmup.  If we restore
+        # ANY entries, skip warmup entirely -- warmup's only purpose
+        # is to populate schedule_cache, and if the cache is already
+        # populated from disk, re-running dummy forwards adds nothing
+        # except GPU-work cost.
+        schedule_cache_restored = 0
         if self._schedule_cache_enabled:
-            n = _load_schedule_cache_into_tinygrad(self._schedule_cache_file)
-            if n > 0:
+            schedule_cache_restored = _load_schedule_cache_into_tinygrad(
+                self._schedule_cache_file,
+            )
+            if schedule_cache_restored > 0:
                 print(
-                    f"[egg schedule-cache] loaded {n} entries from "
-                    f"{self._schedule_cache_file}",
+                    f"[egg schedule-cache] loaded {schedule_cache_restored} "
+                    f"entries from {self._schedule_cache_file}; skipping "
+                    f"warmup (cache already populated)",
                     flush=True,
                 )
 
@@ -339,8 +347,16 @@ class TinygradBackend(StepBackend):
         #   full  -- warm every chunk-aligned position 0, CHUNK,
         #            2*CHUNK, ..., up to max_context.  Longest load
         #            (~minutes) but every real request is fast.
+        # Skip warmup if schedule_cache load covered it -- warmup's
+        # only value is populating schedule_cache, which just happened
+        # from disk.  Running it anyway would just be dummy GPU work
+        # for entries already cached.
+        if schedule_cache_restored > 0:
+            warmup_mode = "off"
+        else:
+            warmup_mode = os.environ.get("EGG_WARMUP", "first")
         self._warmup(
-            mode=os.environ.get("EGG_WARMUP", "first"),
+            mode=warmup_mode,
             chunk_size=int(os.environ.get("EGG_PREFILL_CHUNK", "128")),
         )
 
