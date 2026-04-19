@@ -57,7 +57,47 @@
 # is stuck.
 set -euo pipefail
 
-# tinygrad
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Pin tinygrad's disk cache to a known path in the repo.  Without
+# this, systemd-run's transient --user scope can give the process a
+# different XDG_CACHE_HOME than the user's shell, so compiled kernels
+# land in one path on run N and are looked for in a different path on
+# run N+1 -- every request pays the BEAM compile cost, even though
+# the cache ostensibly "exists".  Pinning to $SCRIPT_DIR/.tinygrad-cache/
+# also keeps the cache reproducibly tied to this repo rather than to
+# a shared user cache that other tinygrad projects might evict.
+export TINYGRAD_CACHE_DIR="${TINYGRAD_CACHE_DIR:-$SCRIPT_DIR/.tinygrad-cache}"
+mkdir -p "$TINYGRAD_CACHE_DIR"
+export CACHEDB="${CACHEDB:-$TINYGRAD_CACHE_DIR/cache.db}"
+# CACHELEVEL=2 is the default but be explicit.  =0 disables the disk
+# cache entirely (don't use unless recovering from a corrupt cache.db).
+export CACHELEVEL="${CACHELEVEL:-2}"
+
+# Report cache state at startup so we can see definitively whether
+# the cache file exists and has data, before any kernel tries to
+# read from it.  If cache.db shows up at 0 bytes every run, tinygrad
+# wasn't flushing to disk on prior exits -- filing as a bug.
+echo "=== tinygrad kernel cache state ==="
+if [[ -f "$CACHEDB" ]]; then
+  size_bytes=$(stat -c '%s' "$CACHEDB")
+  mtime=$(stat -c '%y' "$CACHEDB")
+  printf '  path  : %s\n' "$CACHEDB"
+  printf '  size  : %s bytes\n' "$size_bytes"
+  printf '  mtime : %s\n' "$mtime"
+  # -wal / -shm files indicate an active or unclean SQLite write.
+  for suffix in -wal -shm; do
+    if [[ -f "${CACHEDB}${suffix}" ]]; then
+      s=$(stat -c '%s' "${CACHEDB}${suffix}")
+      printf '  %s : %s bytes\n' "${CACHEDB##*/}${suffix}" "$s"
+    fi
+  done
+else
+  printf '  path  : %s (does NOT exist -- first run, expect full BEAM compile)\n' "$CACHEDB"
+fi
+echo "==================================="
+
+# tinygrad verbosity + beam
 export DEBUG="${DEBUG:-1}"
 export JITBEAM="${JITBEAM:-2}"
 export BEAM_DEBUG="${BEAM_DEBUG:-0}"
@@ -68,8 +108,22 @@ export EGG_DEBUG_PREFIX="${EGG_DEBUG_PREFIX:-1}"
 export EGG_DEBUG_MESSAGES="${EGG_DEBUG_MESSAGES:-1}"
 export EGG_PREFILL_CHUNK="${EGG_PREFILL_CHUNK:-128}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Explicitly forward every env var we care about through systemd-run,
+# rather than relying on --scope's env inheritance (which is murky
+# under --user scopes -- we saw second-restart BEAM recompiles that
+# strongly suggest the child process was reading a different
+# XDG_CACHE_HOME than we set above).
 exec systemd-run --scope --user -p CPUQuota=400% \
+  --setenv=CACHEDB \
+  --setenv=CACHELEVEL \
+  --setenv=TINYGRAD_CACHE_DIR \
+  --setenv=DEBUG \
+  --setenv=JITBEAM \
+  --setenv=BEAM_DEBUG \
+  --setenv=EGG_LOG_FORWARD \
+  --setenv=EGG_DEBUG_PREFIX \
+  --setenv=EGG_DEBUG_MESSAGES \
+  --setenv=EGG_PREFILL_CHUNK \
   "$SCRIPT_DIR/.venv/bin/python" -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
   --backend tinygrad \
   --host 127.0.0.1 --port 8765 \

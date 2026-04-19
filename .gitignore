@@ -1,4 +1,6 @@
-
+video/
+# tinygrad kernel compile cache (pinned to the repo by run_test_server.sh)
+.tinygrad-cache/
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
