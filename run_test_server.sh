@@ -15,6 +15,13 @@
 #                    with progress visible in the log.
 #   BEAM_DEBUG=0     (only relevant if JITBEAM>0)
 #
+# CPU QUOTA: wrapped in systemd-run --scope -p CPUQuota=400% because
+# the bare tinygrad+python process hammers every core and this machine
+# gets thermally/power-unstable under unbounded CPU load.  The 400%
+# cap is ~4 cores worth -- tinygrad's beam search + kernel compile
+# pool is CPU-bound on spawn workers, and leaving it uncapped trips
+# the board's throttling or crashes the desktop session.
+#
 # First request compiles many kernels -- each line like
 #   "*** CUDA 1234  E_... arg N mem X GB  tm 12.3us/45.6ms"
 # tells you a kernel executed.  "CACHE MISS <hash>" means a new
@@ -28,9 +35,10 @@ export JITBEAM="${JITBEAM:-0}"
 export BEAM_DEBUG="${BEAM_DEBUG:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$SCRIPT_DIR/.venv/bin/python" -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
+exec systemd-run --scope --user -p CPUQuota=400% \
+  "$SCRIPT_DIR/.venv/bin/python" -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
   --backend tinygrad \
   --host 127.0.0.1 --port 8765 \
-  --context-length 2048
-#  --keep-packed
+  --context-length 8196 \
+  --keep-packed
 #  --disable-thinking   # user opt-in; do NOT enable by default
