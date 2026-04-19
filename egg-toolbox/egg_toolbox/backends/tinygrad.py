@@ -300,6 +300,8 @@ class TinygradBackend(StepBackend):
             # despite identical conversation history, either (a) the
             # client is resending different tokens each turn (template
             # rendering issue) or (b) _cache_tokens got reset.
+            # When the match breaks partway we also print tokens around
+            # the mismatch point so you can see exactly what diverges.
             cache_head = list(self._cache_tokens[:8])
             cache_tail = list(self._cache_tokens[-8:]) if len(self._cache_tokens) > 8 else []
             prompt_head = list(prompt_list[:8])
@@ -314,6 +316,41 @@ class TinygradBackend(StepBackend):
                 f"prompt_head={prompt_head} prompt_tail={prompt_tail}",
                 flush=True,
             )
+            # If the match broke partway (cp > 0 but cp < min(len cache,
+            # len prompt)), show an 8-token window straddling the
+            # mismatch point.  This is what you need to diagnose BPE
+            # boundary drift or template rendering differences.
+            cap_for_window = min(len(self._cache_tokens), len(prompt_list))
+            if 0 < cp < cap_for_window:
+                lo = max(0, cp - 3)
+                hi = min(cap_for_window, cp + 5)
+                window_cache = list(self._cache_tokens[lo:hi])
+                window_prompt = list(prompt_list[lo:hi])
+                marker = ["<<<" if lo + i == cp else "" for i in range(hi - lo)]
+                print(
+                    f"[egg prefix-cache] mismatch window @ cp={cp} "
+                    f"(indices {lo}..{hi - 1}):\n"
+                    f"  cache:  {window_cache}\n"
+                    f"  prompt: {window_prompt}\n"
+                    f"  marker: {marker}",
+                    flush=True,
+                )
+                # Also try decoding the tokens if a tokenizer is attached;
+                # the text form usually makes the template drift obvious.
+                if self._tokenizer is not None:
+                    try:
+                        cache_text = self._tokenizer.decode(window_cache)
+                        prompt_text = self._tokenizer.decode(window_prompt)
+                        print(
+                            f"[egg prefix-cache]   cache decoded:  {cache_text!r}\n"
+                            f"[egg prefix-cache]   prompt decoded: {prompt_text!r}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[egg prefix-cache]   (decode failed: {exc})",
+                            flush=True,
+                        )
 
         # Rolling penalty window.  Seeded with prompt tail.
         recent = list(prompt_list[-_PENALTY_WINDOW:])
