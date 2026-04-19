@@ -172,6 +172,7 @@ class TinygradBackend(StepBackend):
         self._active_cancel = cancelled
 
         def _run() -> None:
+            debug_prefix = os.environ.get("EGG_DEBUG_PREFIX", "0") != "0"
             try:
                 for tid in self._iter_model_tokens(request, cancelled):
                     if cancelled.is_set():
@@ -180,9 +181,22 @@ class TinygradBackend(StepBackend):
             except BaseException as exc:  # noqa: BLE001
                 # Cache may be partially written; next request must
                 # prefill from 0 to avoid attending to stale K/V.
+                if debug_prefix:
+                    print(
+                        f"[egg prefix-cache] EXCEPTION in _iter_model_tokens "
+                        f"({type(exc).__name__}: {exc}) -- clearing _cache_tokens "
+                        f"(was {len(self._cache_tokens)} tokens)",
+                        flush=True,
+                    )
                 self._cache_tokens = []
                 token_q.put(("__error__", exc))
             finally:
+                if debug_prefix:
+                    print(
+                        f"[egg prefix-cache] request done -- _cache_tokens "
+                        f"now has {len(self._cache_tokens)} tokens",
+                        flush=True,
+                    )
                 token_q.put(SENTINEL)
 
         self._executor.submit(_run)
@@ -255,6 +269,7 @@ class TinygradBackend(StepBackend):
         _PENALTY_WINDOW = 64
 
         enable_cache = os.environ.get("EGG_PREFIX_CACHE", "1") != "0"
+        debug_prefix = os.environ.get("EGG_DEBUG_PREFIX", "0") != "0"
 
         # --- Find longest common prefix with the resident cache. ----
         if enable_cache:
@@ -276,6 +291,29 @@ class TinygradBackend(StepBackend):
         assert cp >= 0
 
         new_suffix = prompt_list[cp:]
+
+        if debug_prefix:
+            # EGG_DEBUG_PREFIX=1: print prefix-cache diagnostics so the
+            # user can see whether the cache is hitting across requests.
+            # "cp" is how many tokens of the new prompt were found in
+            # cache_kv from the prior request.  If cp==0 every request
+            # despite identical conversation history, either (a) the
+            # client is resending different tokens each turn (template
+            # rendering issue) or (b) _cache_tokens got reset.
+            cache_head = list(self._cache_tokens[:8])
+            cache_tail = list(self._cache_tokens[-8:]) if len(self._cache_tokens) > 8 else []
+            prompt_head = list(prompt_list[:8])
+            prompt_tail = list(prompt_list[-8:]) if len(prompt_list) > 8 else []
+            print(
+                f"[egg prefix-cache] enable={enable_cache} "
+                f"prompt_len={len(prompt_list)} "
+                f"cache_len={len(self._cache_tokens)} "
+                f"common_prefix={cp} "
+                f"prefill_tokens={len(new_suffix)} "
+                f"cache_head={cache_head} cache_tail={cache_tail} "
+                f"prompt_head={prompt_head} prompt_tail={prompt_tail}",
+                flush=True,
+            )
 
         # Rolling penalty window.  Seeded with prompt tail.
         recent = list(prompt_list[-_PENALTY_WINDOW:])
