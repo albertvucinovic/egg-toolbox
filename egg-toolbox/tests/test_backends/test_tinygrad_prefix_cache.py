@@ -164,6 +164,21 @@ def _run_request(backend, prompt_tokens, take=5):
     return out
 
 
+@pytest.fixture(autouse=True)
+def _disable_chunked_prefill(monkeypatch):
+    """These tests were written against the single-shot prefill
+    contract where a T-token prompt produces one (T, 0) call.  Chunked
+    prefill (default behaviour as of workspace-14p) instead emits
+    multiple (chunk_size, *) plus (1, *) residual calls, shifting the
+    _FakeModel's scripted-token cursor and breaking the specific
+    (T, start_pos) assertions below.  The prefix-cache invariant itself
+    is identical between paths; chunking is exercised separately in
+    test_tinygrad_chunked_prefill.py.  Pin these tests to the old path
+    so they keep verifying what they were designed to verify.
+    """
+    monkeypatch.setenv("EGG_PREFILL_CHUNK", "0")
+
+
 def test_first_request_full_prefill_then_incremental(monkeypatch):
     """Contract: first request prefills the whole prompt at start_pos=0,
     then decodes one token at a time with start_pos advancing."""

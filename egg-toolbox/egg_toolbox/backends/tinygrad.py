@@ -360,14 +360,64 @@ class TinygradBackend(StepBackend):
             if len(recent) > _PENALTY_WINDOW:
                 del recent[0]
 
-        # --- Prefill the diverging suffix. --------------------------
-        # T > 1 -> non-JIT forward path (matches upstream generate).
-        # The forward has been patched (see _do_load_model) to return
-        # logits shape (1, vocab_size) instead of argmax; we sample in
-        # Python via egg_toolbox.sampling.
-        t = Tensor([new_suffix], dtype="int32")
-        logits = model(t, cp)
-        # cache_kv[0:len(prompt_list)) now reflects prompt_list exactly.
+        # --- Chunked prefill of the diverging suffix. ---------------
+        # Rather than feed ``new_suffix`` as one T=len(new_suffix) call
+        # (which compiles a fresh kernel for every unique prompt length
+        # -- a huge cost under JITBEAM>=1), we feed fixed-size chunks
+        # of length ``EGG_PREFILL_CHUNK`` through a SINGLE shape signature.
+        # After the first request has paid the BEAM compile cost for
+        # T=CHUNK kernels, every future prefill of any length reuses
+        # those cached kernels from tinygrad's on-disk cache.db.  The
+        # residual <CHUNK_T tokens at the tail feed one-at-a-time
+        # through the already-JITted T=1 decode path.
+        #
+        # EGG_PREFILL_CHUNK=0 disables chunking and restores the old
+        # single-shot prefill (useful for A/B debugging).
+        chunk_size_env = os.environ.get("EGG_PREFILL_CHUNK", "128")
+        try:
+            chunk_size = int(chunk_size_env)
+        except ValueError:
+            chunk_size = 128
+
+        v_start_pos = UOp.variable("start_pos", 1, model.max_context - 1)
+        use_sym = bool(getenv("SYM", 1))
+
+        # Helper: run one forward.  Uses UOp-bound start_pos when
+        # possible (start_pos>=1 and SYM enabled) so tinygrad can
+        # reuse the same compiled kernel across different positions.
+        # Falls back to an int for pos=0 because the UOp's declared
+        # range is [1, max_context-1).
+        def _forward(chunk_tokens: list[int], sp_int: int):
+            t = Tensor([chunk_tokens], dtype="int32")
+            if use_sym and sp_int >= 1:
+                sp = v_start_pos.bind(sp_int)
+            else:
+                sp = sp_int
+            return model(t, sp)
+
+        feed_pos = cp
+        end_pos = len(prompt_list)
+        logits = None
+
+        if chunk_size > 0:
+            while feed_pos + chunk_size <= end_pos:
+                chunk = list(prompt_list[feed_pos:feed_pos + chunk_size])
+                logits = _forward(chunk, feed_pos)
+                feed_pos += chunk_size
+
+            # Residual (< chunk_size tokens) via T=1 each.  This path
+            # hits the T=1 decode kernel, which is also reused across
+            # all requests.
+            while feed_pos < end_pos:
+                logits = _forward([prompt_list[feed_pos]], feed_pos)
+                feed_pos += 1
+        else:
+            # Unchunked fallback: single large prefill.
+            logits = _forward(list(prompt_list[cp:]), cp)
+            feed_pos = end_pos
+
+        assert logits is not None, "prefill produced no logits -- suffix length was 0?"
+        # cache_kv[0:end_pos) now reflects prompt_list exactly.
         self._cache_tokens = list(prompt_list)
         next_id = sample_next_token(
             np.asarray(logits.tolist()[0], dtype=np.float32),
@@ -382,10 +432,8 @@ class TinygradBackend(StepBackend):
         # T = 1 with UOp-bound start_pos: hits the JITted kernel, which
         # persists across requests because start_pos is symbolic.  We
         # intentionally do NOT call forward_jit.reset().
-        v_start_pos = UOp.variable("start_pos", 1, model.max_context - 1)
         pos = len(prompt_list)
         max_ctx = model.max_context
-        use_sym = bool(getenv("SYM", 1))
         while pos < max_ctx:
             if cancelled.is_set():
                 break
