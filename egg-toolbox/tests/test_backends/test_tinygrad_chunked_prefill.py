@@ -245,6 +245,46 @@ class TestChunkedPrefillWithPrefixCache:
 # Correctness: yielded tokens + cache invariant                        #
 # =================================================================== #
 
+class TestChunkedPrefillStartPosTyping:
+    """Regression: tinygrad's TransformerBlock._attention constructs
+    the causal mask via triu over a ``(1, 1, T, start_pos+T)`` shape,
+    and ``triu`` rejects symbolic shape dims.  So T>1 chunk calls MUST
+    pass an int start_pos; only T=1 residual/decode calls may pass a
+    UOp.  This test enforces that contract against a stricter fake
+    model that blows up if T>1 sees a UOp.
+    """
+
+    def _strict_fake(self, script):
+        class _StrictFakeModel(_FakeModel):
+            def __call__(self_inner, t, start_pos):
+                T = t.shape[1]
+                is_uop = hasattr(start_pos, "_bound_value")
+                if T > 1 and is_uop:
+                    raise AssertionError(
+                        f"T={T}>1 must use int start_pos (symbolic "
+                        f"shapes break triu); got UOp"
+                    )
+                return super().__call__(t, start_pos)
+        return _StrictFakeModel(script)
+
+    def test_chunks_use_int_start_pos(self, monkeypatch):
+        monkeypatch.setenv("EGG_PREFILL_CHUNK", "64")
+        fake = self._strict_fake(script=[42])
+        backend = _make_loaded_backend(monkeypatch, fake)
+        # 200-token prompt => 3 chunks of 64 (T>1) + 8 residual (T=1).
+        # If any chunk call passes a UOp, the strict fake raises.
+        result = _run_request(backend, list(range(1, 201)), take=1)
+        assert result == [42], result
+
+    def test_unchunked_fallback_uses_int_start_pos(self, monkeypatch):
+        """EGG_PREFILL_CHUNK=0 path must also pass int start_pos."""
+        monkeypatch.setenv("EGG_PREFILL_CHUNK", "0")
+        fake = self._strict_fake(script=[42])
+        backend = _make_loaded_backend(monkeypatch, fake)
+        result = _run_request(backend, list(range(1, 51)), take=1)
+        assert result == [42], result
+
+
 class TestChunkedPrefillCorrectness:
     def test_first_yielded_token_comes_from_last_prefill_logits(self, monkeypatch):
         """The token we yield FIRST after prefill must be the sampled

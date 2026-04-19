@@ -382,18 +382,34 @@ class TinygradBackend(StepBackend):
         v_start_pos = UOp.variable("start_pos", 1, model.max_context - 1)
         use_sym = bool(getenv("SYM", 1))
 
-        # Helper: run one forward.  Uses UOp-bound start_pos when
-        # possible (start_pos>=1 and SYM enabled) so tinygrad can
-        # reuse the same compiled kernel across different positions.
+        # Helper: run one T=1 forward via the JITted decode kernel.
+        # UOp-bound start_pos (for sp_int>=1) lets tinygrad reuse the
+        # same compiled kernel across every decode position.
         # Falls back to an int for pos=0 because the UOp's declared
         # range is [1, max_context-1).
-        def _forward(chunk_tokens: list[int], sp_int: int):
-            t = Tensor([chunk_tokens], dtype="int32")
+        def _forward_t1(tok: int, sp_int: int):
+            t = Tensor([[tok]], dtype="int32")
             if use_sym and sp_int >= 1:
                 sp = v_start_pos.bind(sp_int)
             else:
                 sp = sp_int
             return model(t, sp)
+
+        # Helper: run one forward with T>1 (chunk prefill).
+        # MUST use an int start_pos because tinygrad's TransformerBlock
+        # constructs the causal mask via ``triu(start_pos+1)`` over a
+        # shape of ``(1, 1, T, start_pos+T)``, and ``triu`` asserts
+        # that the shape dims are plain ints (see tensor.py::_tri).
+        # A UOp start_pos here raises "does not support symbolic".
+        # We accept the tradeoff: each unique chunk start position
+        # compiles its own kernel (up to max_context/chunk_size
+        # distinct kernels, ~64 for default settings), all disk-cached
+        # after first compile -- still a big win over the pre-chunking
+        # behaviour where every unique prompt length T triggered a
+        # fresh BEAM compile.
+        def _forward_chunk(chunk_tokens: list[int], sp_int: int):
+            t = Tensor([chunk_tokens], dtype="int32")
+            return model(t, sp_int)
 
         feed_pos = cp
         end_pos = len(prompt_list)
@@ -402,18 +418,18 @@ class TinygradBackend(StepBackend):
         if chunk_size > 0:
             while feed_pos + chunk_size <= end_pos:
                 chunk = list(prompt_list[feed_pos:feed_pos + chunk_size])
-                logits = _forward(chunk, feed_pos)
+                logits = _forward_chunk(chunk, feed_pos)
                 feed_pos += chunk_size
 
             # Residual (< chunk_size tokens) via T=1 each.  This path
             # hits the T=1 decode kernel, which is also reused across
             # all requests.
             while feed_pos < end_pos:
-                logits = _forward([prompt_list[feed_pos]], feed_pos)
+                logits = _forward_t1(prompt_list[feed_pos], feed_pos)
                 feed_pos += 1
         else:
-            # Unchunked fallback: single large prefill.
-            logits = _forward(list(prompt_list[cp:]), cp)
+            # Unchunked fallback: single large prefill at int start_pos.
+            logits = _forward_chunk(list(prompt_list[cp:]), cp)
             feed_pos = end_pos
 
         assert logits is not None, "prefill produced no logits -- suffix length was 0?"
