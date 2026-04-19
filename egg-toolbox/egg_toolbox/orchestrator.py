@@ -136,6 +136,33 @@ class Orchestrator:
         response.
         """
 
+        # Optional: dump incoming messages + rendered template for
+        # prefix-cache / reasoning-roundtrip debugging.  Set
+        # EGG_DEBUG_MESSAGES=1 to enable.  Prints, per request:
+        # - each ChatMessage's role, content length, reasoning
+        #   presence/length, tool_calls count
+        # - the last 400 bytes of the rendered template (covers the
+        #   assistant-turn boundary which is where BPE drift lives)
+        # Answers the question: "did the client send reasoning_content
+        # back, and did the template re-insert <think>...</think>?"
+        if os.environ.get("EGG_DEBUG_MESSAGES", "0") != "0":
+            print(f"[egg messages] incoming {len(messages)} message(s):", flush=True)
+            for i, m in enumerate(messages):
+                content_len = (
+                    len(m.content) if isinstance(m.content, str)
+                    else (sum(len(p.text or "") for p in m.content)
+                          if isinstance(m.content, list) else 0)
+                )
+                reasoning_len = len(m.reasoning) if m.reasoning else 0
+                tool_calls_n = len(m.tool_calls) if m.tool_calls else 0
+                print(
+                    f"[egg messages]   [{i}] role={m.role} "
+                    f"content_len={content_len} "
+                    f"reasoning={'yes' if m.reasoning else 'NO'}({reasoning_len}) "
+                    f"tool_calls={tool_calls_n}",
+                    flush=True,
+                )
+
         # 1. Render the prompt using the model's chat template
         prompt_str = self._template.render(
             messages=messages,
@@ -144,6 +171,18 @@ class Orchestrator:
             enable_thinking=self._enable_thinking,
         )
         prompt_tokens = self._tokenizer.encode(prompt_str)
+
+        if os.environ.get("EGG_DEBUG_MESSAGES", "0") != "0":
+            # Show the rendered-template tail around the assistant
+            # boundary so we can tell if <think>...</think> was
+            # re-inserted on replay.
+            tail = prompt_str[-400:] if len(prompt_str) > 400 else prompt_str
+            print(
+                f"[egg messages] rendered prompt: {len(prompt_str)} chars, "
+                f"{len(prompt_tokens)} tokens; tail (last 400 chars):\n"
+                f"---8<---\n{tail}\n--->8---",
+                flush=True,
+            )
 
         # 2. Compute stop conditions from format handler
         stop_strings = self._handler.stop_strings() + sampling.stop
