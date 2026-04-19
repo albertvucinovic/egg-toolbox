@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -9,6 +10,67 @@ from typing import Any, Iterator
 
 from .base import StepBackend, Tokenizer
 from ..types import CompiledRequest
+
+
+# Where we persist the set of chunk positions we've actually seen in
+# real requests.  The ``persisted`` warmup mode reads this file at
+# load time and warms those positions before any user request lands,
+# trading a bounded one-time load cost for fast steady-state response.
+# Keyed by (chunk_size, max_context) so stale entries don't apply when
+# the user changes those.
+def _default_positions_file() -> str:
+    base = os.environ.get(
+        "XDG_CACHE_HOME",
+        os.path.expanduser("~/.cache"),
+    )
+    return os.path.join(base, "egg-toolbox", "warmup-positions.json")
+
+
+def _load_warmup_positions(
+    path: str, chunk_size: int, max_context: int,
+) -> list[int]:
+    """Return the persisted list of chunk-aligned positions seen in
+    previous runs, filtered to match the current (chunk_size,
+    max_context).  Entries that don't match are silently dropped so
+    upgrades / config changes don't crash the server."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    if data.get("chunk_size") != chunk_size:
+        return []
+    if data.get("max_context") != max_context:
+        return []
+    positions = data.get("positions", [])
+    if not isinstance(positions, list):
+        return []
+    return sorted({
+        int(p) for p in positions
+        if isinstance(p, int) and 0 <= p < max_context - chunk_size
+    })
+
+
+def _save_warmup_positions(
+    path: str, chunk_size: int, max_context: int, positions: set[int],
+) -> None:
+    """Atomically write the observed positions to disk.  Tolerant of
+    write failures -- a missed save just means the next restart
+    doesn't get the benefit from this session's discoveries."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({
+                "chunk_size": chunk_size,
+                "max_context": max_context,
+                "positions": sorted(positions),
+            }, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 # All tinygrad calls (model load + every generate_tokens invocation)
@@ -95,6 +157,21 @@ class TinygradBackend(StepBackend):
         # EGG_PREFIX_CACHE=0 disables the whole mechanism.
         self._cache_tokens: list[int] = []
 
+        # Chunk-positions observed in real requests, used by the
+        # ``persisted`` warmup mode.  tinygrad's schedule_cache is
+        # in-memory only (engine/schedule.py:130) so every process
+        # restart re-pays ~12s per chunk position on first touch.
+        # By recording which positions this workload actually uses
+        # and replaying the warmup on next startup, we bound the
+        # steady-state cost to one session of discovery.  Saved
+        # after each request to disk at
+        # ``$XDG_CACHE_HOME/egg-toolbox/warmup-positions.json`` (or
+        # EGG_WARMUP_POSITIONS_FILE if set).
+        self._used_chunk_positions: set[int] = set()
+        self._positions_file = os.environ.get(
+            "EGG_WARMUP_POSITIONS_FILE", _default_positions_file(),
+        )
+
     def load_model(self, model_path: str, **kwargs: Any) -> None:
         # Hop onto the dedicated tinygrad thread so the SQLite kernel
         # cache connection (opened lazily inside from_gguf's realize())
@@ -173,10 +250,34 @@ class TinygradBackend(StepBackend):
             # out of range.  Chunk kernels are keyed on int start_pos,
             # so each position is a distinct schedule.
             positions = list(range(0, max_ctx - chunk_size, chunk_size))
+        elif mode == "persisted":
+            # Replay chunk positions this user's workload actually hit
+            # in prior runs.  Falls back to ``first`` if the persisted
+            # file is missing or doesn't match our current (chunk_size,
+            # max_context) -- fresh installs transparently get the
+            # quick warmup until the workload teaches us what to warm.
+            persisted = _load_warmup_positions(
+                self._positions_file, chunk_size, max_ctx,
+            )
+            if persisted:
+                positions = persisted
+                print(
+                    f"[egg warmup] replaying {len(persisted)} "
+                    f"positions from {self._positions_file}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[egg warmup] no persisted positions at "
+                    f"{self._positions_file} (or mismatched chunk/ctx); "
+                    f"falling back to 'first' mode",
+                    flush=True,
+                )
+                positions = [0]
         else:
             print(
-                f"[egg warmup] unknown EGG_WARMUP={mode!r}, "
-                f"accepted: off, first, full.  Skipping.",
+                f"[egg warmup] unknown EGG_WARMUP={mode!r}, accepted: "
+                f"off, first, full, persisted.  Skipping.",
                 flush=True,
             )
             return
@@ -575,6 +676,9 @@ class TinygradBackend(StepBackend):
         # behaviour where every unique prompt length T triggered a
         # fresh BEAM compile.
         def _forward_chunk(chunk_tokens: list[int], sp_int: int, label: str):
+            # Record each position we actually use so the ``persisted``
+            # warmup mode can replay exactly these on next startup.
+            self._used_chunk_positions.add(sp_int)
             t = Tensor([chunk_tokens], dtype="int32")
             return _call(label, t, sp_int)
 
@@ -676,6 +780,19 @@ class TinygradBackend(StepBackend):
                     f"total={total_fwd}calls/{total_ms:.0f}ms; "
                     f"slowest={slow_ms:.0f}ms ({slow_label})",
                     flush=True,
+                )
+            # Persist the chunk positions we've touched this session so
+            # the ``persisted`` warmup mode can replay them on next
+            # startup.  Cheap (small JSON, atomic replace); failures
+            # are silent.  We save after EVERY request so the set is
+            # up-to-date even if the server exits ungracefully (crash,
+            # SIGKILL, power loss).
+            if self._used_chunk_positions:
+                _save_warmup_positions(
+                    self._positions_file,
+                    chunk_size,
+                    model.max_context,
+                    self._used_chunk_positions,
                 )
 
     def model_name(self) -> str:

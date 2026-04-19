@@ -40,15 +40,27 @@
 #                           =0 disables chunking (single-shot prefill,
 #                           slower on novel T values because kernels
 #                           recompile).
-#   EGG_WARMUP=first        warm tinygrad's in-memory schedule_cache
+#   EGG_WARMUP=persisted    warm tinygrad's in-memory schedule_cache
 #                           at load time so the first user request
 #                           doesn't pay ~12s per chunk position.
-#                           Modes: ``off`` (skip), ``first`` (one
-#                           chunk @ 0 + one T=1 decode; default;
-#                           ~12s added to load), ``full`` (every
-#                           chunk-aligned position up to max_context;
-#                           many minutes added to load but every
-#                           real request is fast).
+#                           Modes:
+#                           - ``off``       skip warmup entirely.
+#                           - ``first``     chunk @ 0 + T=1 decode
+#                                           (~12s added to load).
+#                           - ``full``      every chunk-aligned
+#                                           position up to max_context
+#                                           (~minutes added to load).
+#                           - ``persisted`` replay the chunk positions
+#                                           this workload actually used
+#                                           in prior runs (read from
+#                                           $XDG_CACHE_HOME/egg-toolbox/
+#                                           warmup-positions.json).
+#                                           Default.  Falls back to
+#                                           ``first`` on missing/
+#                                           mismatched file.  Bounds
+#                                           steady-state per-restart
+#                                           cost to what this user's
+#                                           conversations actually hit.
 #
 # -- CPU quota --
 # Wrapped in systemd-run --scope -p CPUQuota=400% because the bare
@@ -139,7 +151,7 @@ export EGG_LOG_FORWARD="${EGG_LOG_FORWARD:-1}"
 export EGG_DEBUG_PREFIX="${EGG_DEBUG_PREFIX:-1}"
 export EGG_DEBUG_MESSAGES="${EGG_DEBUG_MESSAGES:-1}"
 export EGG_PREFILL_CHUNK="${EGG_PREFILL_CHUNK:-128}"
-export EGG_WARMUP="${EGG_WARMUP:-first}"
+export EGG_WARMUP="${EGG_WARMUP:-persisted}"
 
 # Force Python's stdout/stderr unbuffered so tinygrad's DEBUG lines
 # and our EGG_* prints flush immediately rather than accumulating in

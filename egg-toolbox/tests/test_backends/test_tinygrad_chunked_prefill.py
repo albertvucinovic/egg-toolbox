@@ -12,6 +12,7 @@ every ``model.__call__`` records the (T, start_pos) pair it saw.
 """
 from __future__ import annotations
 
+import json
 import sys
 import time
 import types
@@ -283,6 +284,116 @@ class TestChunkedPrefillStartPosTyping:
         backend = _make_loaded_backend(monkeypatch, fake)
         result = _run_request(backend, list(range(1, 51)), take=1)
         assert result == [42], result
+
+
+class TestPersistedWarmupPositions:
+    """Positions touched by real chunk forwards are persisted to a
+    JSON file so the next process restart can replay them via
+    ``EGG_WARMUP=persisted``, bounding the steady-state per-restart
+    cost to whatever chunk positions this workload actually uses
+    rather than every chunk-aligned position up to max_context."""
+
+    def test_positions_accumulated_during_real_chunks(self, monkeypatch, tmp_path):
+        positions_file = str(tmp_path / "warmup-positions.json")
+        monkeypatch.setenv("EGG_WARMUP_POSITIONS_FILE", positions_file)
+        monkeypatch.setenv("EGG_PREFILL_CHUNK", "64")
+        fake = _FakeModel(script=[42], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+
+        # 200-token prompt => 3 chunks at positions 0, 64, 128 + residual.
+        _run_request(backend, list(range(1, 201)), take=1)
+        # Set should contain the chunk positions we touched.
+        assert backend._used_chunk_positions == {0, 64, 128}
+
+    def test_positions_persisted_to_disk(self, monkeypatch, tmp_path):
+        positions_file = str(tmp_path / "warmup-positions.json")
+        monkeypatch.setenv("EGG_WARMUP_POSITIONS_FILE", positions_file)
+        monkeypatch.setenv("EGG_PREFILL_CHUNK", "64")
+        fake = _FakeModel(script=[42], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+
+        _run_request(backend, list(range(1, 201)), take=1)
+
+        with open(positions_file) as f:
+            data = json.load(f)
+        assert data["chunk_size"] == 64
+        assert data["max_context"] == 512
+        assert sorted(data["positions"]) == [0, 64, 128]
+
+    def test_persisted_mode_loads_and_warms_saved_positions(
+        self, monkeypatch, tmp_path,
+    ):
+        positions_file = str(tmp_path / "warmup-positions.json")
+        # Pre-populate the file as if a prior session had used
+        # these positions.
+        with open(positions_file, "w") as f:
+            json.dump({
+                "chunk_size": 128,
+                "max_context": 512,
+                "positions": [0, 128, 256],
+            }, f)
+        monkeypatch.setenv("EGG_WARMUP_POSITIONS_FILE", positions_file)
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+
+        backend._warmup(mode="persisted", chunk_size=128)
+        # Expected warmup calls: three chunks at 0, 128, 256 + one T=1.
+        assert fake.calls == [
+            (128, 0), (128, 128), (128, 256), (1, 1),
+        ], fake.calls
+
+    def test_persisted_mode_falls_back_to_first_when_file_missing(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        positions_file = str(tmp_path / "does-not-exist.json")
+        monkeypatch.setenv("EGG_WARMUP_POSITIONS_FILE", positions_file)
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+
+        backend._warmup(mode="persisted", chunk_size=128)
+        # Fallback = "first" mode: one chunk @ 0 + one T=1.
+        assert fake.calls == [(128, 0), (1, 1)], fake.calls
+        captured = capsys.readouterr()
+        assert "no persisted positions" in captured.out
+
+    def test_persisted_mode_rejects_mismatched_chunk_size(
+        self, monkeypatch, tmp_path,
+    ):
+        """If the saved file was generated with a different chunk_size
+        or max_context than the current run, ignore it and fall back
+        to 'first'.  Prevents the warmup from binding start_pos values
+        that are no longer chunk-aligned under the new config."""
+        positions_file = str(tmp_path / "warmup-positions.json")
+        with open(positions_file, "w") as f:
+            json.dump({
+                "chunk_size": 64,  # mismatch: we'll run with 128
+                "max_context": 512,
+                "positions": [0, 64, 128],
+            }, f)
+        monkeypatch.setenv("EGG_WARMUP_POSITIONS_FILE", positions_file)
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+
+        backend._warmup(mode="persisted", chunk_size=128)
+        assert fake.calls == [(128, 0), (1, 1)], fake.calls
+
+    def test_malformed_positions_file_does_not_crash(
+        self, monkeypatch, tmp_path,
+    ):
+        positions_file = str(tmp_path / "warmup-positions.json")
+        with open(positions_file, "w") as f:
+            f.write("not valid json {{{")
+        monkeypatch.setenv("EGG_WARMUP_POSITIONS_FILE", positions_file)
+        fake = _FakeModel(script=[0], max_context=512)
+        backend = _make_loaded_backend(monkeypatch, fake)
+        fake.calls.clear()
+
+        # Should fall back to "first" without raising.
+        backend._warmup(mode="persisted", chunk_size=128)
+        assert fake.calls == [(128, 0), (1, 1)], fake.calls
 
 
 class TestWarmup:
