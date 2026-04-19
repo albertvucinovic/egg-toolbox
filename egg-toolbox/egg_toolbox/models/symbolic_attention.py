@@ -55,37 +55,48 @@ def symbolic_causal_mask(
     """
     from tinygrad import Tensor
 
-    # Strategy: build the (1, 1, T, max_context) mask entirely with
-    # FIXED int-shape ops (no symbolic-shape dimension anywhere in
-    # the intermediate graph), then apply the symbolic slice as the
-    # very last step.  Only then does the shape involve the UOp --
-    # and tinygrad's cache_kv code already exercises that exact
-    # "symbolic slice on the last axis" pattern inside _attention.
-    # Ops that query ``.ndim`` / ``.shape`` (``unsqueeze``, ``reshape
-    # -1``) fail on already-symbolic tensors, so doing all those BEFORE
-    # the symbolic slice avoids the problem entirely.
+    # Build the mask DIRECTLY at the target symbolic shape
+    # ``(1, 1, T, start_pos+T)``.  An earlier version of this
+    # function worked by constructing at fixed ``(T, max_context)``
+    # and slicing the last dim down at the end, but the scheduler
+    # had to chew through a (T, 8192) graph on every prefill chunk
+    # -- ~30x slower cold-compile than this direct path on a
+    # measured benchmark (68ms vs 2036ms for the mask alone).
+    #
+    # Pattern: a symbolic-sized column index from slicing a fixed
+    # arange, broadcast-subtracted against a fixed row index, then
+    # compared + ``where``.  The one tricky move is that you can't
+    # call ``.unsqueeze()``/``.reshape(..., -1)`` on a
+    # symbolic-shape tensor (those query ``.ndim`` / ``.shape``
+    # which assert int dims), but reshape to an explicit tuple that
+    # includes the symbolic dim DOES work -- same shape signature
+    # that tinygrad's own ``Tensor.full((1,1,T,start_pos+T), -inf)``
+    # uses internally.
 
-    # Fixed-shape index grids.
-    rows = Tensor.arange(T, device=device).reshape(T, 1)          # (T, 1)
-    cols = Tensor.arange(max_context, device=device).reshape(1, max_context)
+    # Column indices at symbolic extent: slice a fixed arange.
+    # ``cache_kv[..., 0:start_pos+T, ...]`` uses the same pattern.
+    cols_fixed = Tensor.arange(max_context, device=device)        # (max_ctx,)
+    cols_sym = cols_fixed[:start_pos + T]                         # (start_pos+T,) symbolic
 
-    # ``i - j + start_pos >= 0`` iff ``j <= start_pos + i`` (causal).
-    # ``start_pos`` here is a scalar (int or UOp); adding to a fixed-
-    # shape tensor leaves the tensor's shape fixed -- the value is
-    # symbolic but the shape is not.
-    shifted = (rows - cols) + start_pos                           # (T, max_context)
-    allowed = shifted >= 0                                        # (T, max_context) bool
+    # Row indices at fixed extent.
+    rows = Tensor.arange(T, device=device)                        # (T,)
+
+    # Broadcast ``(T, 1)`` minus ``(start_pos+T,)`` gives
+    # ``(T, start_pos+T)`` with numpy-style right-align broadcasting,
+    # no explicit unsqueeze of the symbolic side needed.
+    # ``j <= start_pos + i`` iff ``(i - j + start_pos) >= 0``.
+    offset = (rows.reshape(T, 1) - cols_sym) + start_pos          # (T, start_pos+T)
+    allowed = offset >= 0                                         # (T, start_pos+T) bool
 
     minus_inf = Tensor.full((1,), float("-inf"), dtype=dtype, device=device)
     zero = Tensor.full((1,), 0.0, dtype=dtype, device=device)
-    mask_full = allowed.where(zero, minus_inf)                    # (T, max_context)
+    mask = allowed.where(zero, minus_inf)                         # (T, start_pos+T)
 
-    # Add the two broadcast dims WHILE shape is still fully int.
-    mask_full_4d = mask_full.reshape(1, 1, T, max_context)        # (1, 1, T, max_context)
-
-    # Final symbolic slice -- same pattern as tinygrad's cache_kv[:,
-    # :, :, 0:start_pos+T, :] inside _attention.
-    return mask_full_4d[:, :, :, :start_pos + T]                  # (1, 1, T, start_pos+T)
+    # Reshape with explicit shape tuple (including the symbolic
+    # dim) is supported -- it's the same tuple ``Tensor.full`` would
+    # accept.  Avoid ``.unsqueeze(...)`` which walks ``.shape`` and
+    # trips the int-assertion on symbolic-shape tensors.
+    return mask.reshape(1, 1, T, start_pos + T)                   # (1, 1, T, start_pos+T)
 
 
 def patch_block_attention(block: Any, max_context: int) -> None:
