@@ -104,14 +104,27 @@ class LlamaArchitecture(Architecture):
         raises ``JitError`` on shape mismatch: ``forward_jit`` for
         T=1 decode, ``forward_jit_chunk`` for T>1 chunks.
         """
+        import os as _os
         from tinygrad import UOp, getenv
 
-        if getenv("JIT", 1) and isinstance(start_pos, UOp):
-            if tokens.shape[1] == 1:
-                return self.forward_jit(tokens, start_pos)
-            elif self._jit_chunks:
-                return self.forward_jit_chunk(tokens, start_pos)
-        return self._forward_logits(tokens, start_pos)
+        debug = _os.environ.get("EGG_DEBUG_JIT", "0") != "0"
+        path = "eager"
+        try:
+            if getenv("JIT", 1) and isinstance(start_pos, UOp):
+                if tokens.shape[1] == 1:
+                    path = "jit-decode"
+                    return self.forward_jit(tokens, start_pos)
+                elif self._jit_chunks:
+                    path = f"jit-chunk-T{tokens.shape[1]}"
+                    return self.forward_jit_chunk(tokens, start_pos)
+            return self._forward_logits(tokens, start_pos)
+        finally:
+            if debug:
+                print(
+                    f"[egg jit] path={path} T={tokens.shape[1]} "
+                    f"start_pos_is_uop={isinstance(start_pos, UOp)}",
+                    flush=True,
+                )
 
     @classmethod
     def from_gguf_kv(

@@ -440,7 +440,7 @@ class TinygradBackend(StepBackend):
         # trace.  Without the flag we warm at each int position, same
         # as before.
         jit_chunks = os.environ.get("EGG_JIT_CHUNKS", "0") != "0"
-        v_sp_warmup = UOp.variable("start_pos", 1, self._model.max_context - 1)
+        v_sp_warmup = UOp.variable("start_pos", 0, self._model.max_context - 1)
 
         # Chunk kernels.
         if jit_chunks:
@@ -485,7 +485,7 @@ class TinygradBackend(StepBackend):
 
         # T=1 decode kernel (UOp-bound start_pos).  Only needs one
         # warmup because the same kernel serves every decode step.
-        v_sp = UOp.variable("start_pos", 1, max_ctx - 1)
+        v_sp = UOp.variable("start_pos", 0, max_ctx - 1)
         t = Tensor([[dummy_decode]], dtype="int32")
         t0 = _time.monotonic()
         try:
@@ -764,7 +764,11 @@ class TinygradBackend(StepBackend):
         except ValueError:
             chunk_size = 128
 
-        v_start_pos = UOp.variable("start_pos", 1, model.max_context - 1)
+        # UOp range starts at 0 so chunk @ 0 (the first prefill chunk of
+        # any request that doesn't share a prefix) can ALSO bind to the
+        # symbolic JIT trace.  Previously we started at 1, forcing
+        # chunk @ 0 through the eager path every time.
+        v_start_pos = UOp.variable("start_pos", 0, model.max_context - 1)
         use_sym = bool(getenv("SYM", 1))
 
         # Annotated per-forward log.  ``EGG_LOG_FORWARD=1`` prints one
@@ -819,13 +823,13 @@ class TinygradBackend(StepBackend):
             return out
 
         # Helper: run one T=1 forward via the JITted decode kernel.
-        # UOp-bound start_pos (for sp_int>=1) lets tinygrad reuse the
-        # same compiled kernel across every decode position.
-        # Falls back to an int for pos=0 because the UOp's declared
-        # range is [1, max_context-1).
+        # UOp-bound start_pos lets tinygrad reuse the same compiled
+        # kernel across every decode position.  v_start_pos's range
+        # now includes 0 so every forward (including the very first
+        # one) can use the symbolic trace.
         def _forward_t1(tok: int, sp_int: int, label: str):
             t = Tensor([[tok]], dtype="int32")
-            if use_sym and sp_int >= 1:
+            if use_sym and sp_int >= 0:
                 sp = v_start_pos.bind(sp_int)
             else:
                 sp = sp_int
@@ -857,7 +861,7 @@ class TinygradBackend(StepBackend):
             # warmup mode can replay exactly these on next startup.
             self._used_chunk_positions.add(sp_int)
             t = Tensor([chunk_tokens], dtype="int32")
-            if jit_chunks and use_sym and sp_int >= 1:
+            if jit_chunks and use_sym and sp_int >= 0:
                 sp: Any = v_start_pos.bind(sp_int)
             else:
                 sp = sp_int
