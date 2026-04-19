@@ -188,9 +188,22 @@ export EGG_WARMUP="${EGG_WARMUP:-persisted}"
 export EGG_SCHEDULE_CACHE="${EGG_SCHEDULE_CACHE:-1}"
 # Experimental: JIT-eligible T>1 prefill chunks via symbolic-mask
 # attention.  Patches each TransformerBlock's _attention method to
-# use arange+where instead of triu.  Default 1 to try it; revert to
-# 0 if something's broken at startup or first chunk forward.
-export EGG_JIT_CHUNKS="${EGG_JIT_CHUNKS:-1}"
+# use arange+where instead of triu, so one symbolic JIT trace covers
+# every chunk position.  In principle: ~400ms per chunk after a full
+# warmup, vs ~8s eager.
+#
+# Default 0 because turning it on requires a COLD first-run warmup
+# that compiles new kernel signatures (the UOp-range change).  With
+# JITBEAM=2 + --keep-packed (the defaults here), that cold compile
+# hits workspace-2gi -- the tinygrad multiprocess BEAM pool deadlocks
+# on cache.db WAL contention and never completes.  To try JIT chunks:
+#   1. First, populate cache.db without BEAM:
+#        EGG_JIT_CHUNKS=1 JITBEAM=0 ./run_test_server.sh
+#      wait for warmup to finish, then kill.
+#   2. Then re-run with BEAM restored:
+#        EGG_JIT_CHUNKS=1 ./run_test_server.sh
+# After those two runs, steady-state chunks should be ~400ms.
+export EGG_JIT_CHUNKS="${EGG_JIT_CHUNKS:-0}"
 
 # Force Python's stdout/stderr unbuffered so tinygrad's DEBUG lines
 # and our EGG_* prints flush immediately rather than accumulating in
