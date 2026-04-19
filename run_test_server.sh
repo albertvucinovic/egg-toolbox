@@ -40,6 +40,19 @@
 #                           =0 disables chunking (single-shot prefill,
 #                           slower on novel T values because kernels
 #                           recompile).
+#   EGG_SCHEDULE_CACHE=1    EXPERIMENTAL: persist tinygrad's actual
+#                           schedule_cache dict to disk and reload on
+#                           startup.  Near-instant scheduling on
+#                           restart rather than the per-position
+#                           replay cost of EGG_WARMUP=persisted.
+#                           Opt-in because it depends on tinygrad-
+#                           internals stability -- a version bump
+#                           can break the pickle format (discarded
+#                           silently in that case, falls back to
+#                           position replay).
+#   EGG_SCHEDULE_CACHE_FILE path to the pickle file.  Default:
+#                           $XDG_CACHE_HOME/egg-toolbox/
+#                           schedule-cache.pkl.
 #   EGG_WARMUP=persisted    warm tinygrad's in-memory schedule_cache
 #                           at load time so the first user request
 #                           doesn't pay ~12s per chunk position.
@@ -152,6 +165,12 @@ export EGG_DEBUG_PREFIX="${EGG_DEBUG_PREFIX:-1}"
 export EGG_DEBUG_MESSAGES="${EGG_DEBUG_MESSAGES:-1}"
 export EGG_PREFILL_CHUNK="${EGG_PREFILL_CHUNK:-128}"
 export EGG_WARMUP="${EGG_WARMUP:-persisted}"
+# Experimental: full schedule_cache persistence.  Opt-in.  If it
+# works on your workload, near-instant restart.  If tinygrad changes
+# its schedule_cache internals in a way that breaks the pickle
+# format, the load step logs and discards silently and we fall back
+# to position-replay.
+export EGG_SCHEDULE_CACHE="${EGG_SCHEDULE_CACHE:-1}"
 
 # Force Python's stdout/stderr unbuffered so tinygrad's DEBUG lines
 # and our EGG_* prints flush immediately rather than accumulating in
@@ -178,6 +197,7 @@ exec systemd-run --scope --user -p CPUQuota=400% \
   --setenv="EGG_DEBUG_MESSAGES=$EGG_DEBUG_MESSAGES" \
   --setenv="EGG_PREFILL_CHUNK=$EGG_PREFILL_CHUNK" \
   --setenv="EGG_WARMUP=$EGG_WARMUP" \
+  --setenv="EGG_SCHEDULE_CACHE=$EGG_SCHEDULE_CACHE" \
   --setenv="PYTHONUNBUFFERED=$PYTHONUNBUFFERED" \
   "$SCRIPT_DIR/.venv/bin/python" -u -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
   --backend tinygrad \

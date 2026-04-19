@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +11,83 @@ from typing import Any, Iterator
 
 from .base import StepBackend, Tokenizer
 from ..types import CompiledRequest
+
+
+def _default_schedule_cache_file() -> str:
+    base = os.environ.get(
+        "XDG_CACHE_HOME",
+        os.path.expanduser("~/.cache"),
+    )
+    return os.path.join(base, "egg-toolbox", "schedule-cache.pkl")
+
+
+def _load_schedule_cache_into_tinygrad(path: str) -> int:
+    """Read a previously saved ``schedule_cache`` snapshot from disk
+    and merge it into tinygrad's module-level dict so subsequent
+    forwards hit those cached schedules instead of re-running the
+    ~125ms/layer create_schedule() pass.
+
+    Returns the number of entries restored.  Tolerant of missing/
+    malformed files -- those return 0 and leave the cache alone.
+
+    Buffer portability across processes is handled by tinygrad itself:
+    ``pm_pre_sched_cache`` rewrites UNIQUE -> LUNIQUE before hashing
+    the key, and ``pm_post_sched_cache`` re-binds LUNIQUE -> current
+    process's input_buffers at each retrieval, so serialized entries
+    don't hold stale GPU memory handles.
+    """
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "rb") as f:
+            restored: dict = pickle.load(f)
+    except (OSError, pickle.PickleError, EOFError, AttributeError) as exc:
+        print(
+            f"[egg schedule-cache] load failed ({type(exc).__name__}: "
+            f"{exc}); discarding.  Remove the file and retry if "
+            f"you want to rebuild from scratch: {path}",
+            flush=True,
+        )
+        return 0
+    if not isinstance(restored, dict):
+        return 0
+    try:
+        from tinygrad.engine.schedule import schedule_cache
+        before = len(schedule_cache)
+        schedule_cache.update(restored)
+        after = len(schedule_cache)
+        return after - before
+    except ImportError:
+        return 0
+
+
+def _save_schedule_cache_from_tinygrad(path: str) -> None:
+    """Snapshot tinygrad's module-level ``schedule_cache`` to disk so
+    the next process restart can skip the expensive scheduling pass.
+    Atomic write via tmp + replace so a crashed save doesn't corrupt
+    the file readers of a prior good save would pick up.
+
+    Silent on failure -- a missed save just means next restart has
+    to rebuild from positions.
+    """
+    try:
+        from tinygrad.engine.schedule import schedule_cache
+    except ImportError:
+        return
+    if not schedule_cache:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        # Snapshot dict contents before pickling so concurrent writes
+        # from the backend thread (if any) don't see a half-iterated
+        # dict -- Python dict copy is atomic from Python-level view.
+        snapshot = dict(schedule_cache)
+        with open(tmp, "wb") as f:
+            pickle.dump(snapshot, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except (OSError, pickle.PickleError):
+        pass
 
 
 # Where we persist the set of chunk positions we've actually seen in
@@ -172,6 +250,29 @@ class TinygradBackend(StepBackend):
             "EGG_WARMUP_POSITIONS_FILE", _default_positions_file(),
         )
 
+        # Experimental: persist tinygrad's module-level
+        # ``schedule_cache`` (engine/schedule.py:130) across process
+        # restarts by pickling it to disk.  Unlike persisted-positions
+        # (which replays a list to rebuild schedule_cache via dummy
+        # forwards, paying ~12s per position at each startup), this
+        # stores the actual scheduled UOp trees + ExecItems.  On next
+        # startup we unpickle them straight into the cache dict so the
+        # schedule pass is skipped entirely -- seconds of load instead
+        # of minutes.  Tinygrad's own pm_pre_sched_cache /
+        # pm_post_sched_cache rewrites make entries portable: buffer
+        # references are replaced with LUNIQUE placeholders before
+        # hashing and re-bound to the current process's buffers on
+        # retrieval, so stale GPU handles from the previous process
+        # never get executed.  Opt-in because this depends on
+        # tinygrad-internals stability (a version bump could break
+        # the pickle format).
+        self._schedule_cache_enabled = (
+            os.environ.get("EGG_SCHEDULE_CACHE", "0") != "0"
+        )
+        self._schedule_cache_file = os.environ.get(
+            "EGG_SCHEDULE_CACHE_FILE", _default_schedule_cache_file(),
+        )
+
     def load_model(self, model_path: str, **kwargs: Any) -> None:
         # Hop onto the dedicated tinygrad thread so the SQLite kernel
         # cache connection (opened lazily inside from_gguf's realize())
@@ -207,6 +308,19 @@ class TinygradBackend(StepBackend):
         bos_id = int(bos_id_raw) if bos_id_raw is not None else None
 
         self._tokenizer = TinygradTokenizer(tokenizer, eos_id=eos_id, bos_id=bos_id)
+
+        # Restore tinygrad's schedule_cache from disk before warmup so
+        # positions we've seen in prior runs don't re-run the schedule
+        # pass.  Under EGG_SCHEDULE_CACHE=1 this is a seconds-scale
+        # load vs minutes for position-replay warmup.
+        if self._schedule_cache_enabled:
+            n = _load_schedule_cache_into_tinygrad(self._schedule_cache_file)
+            if n > 0:
+                print(
+                    f"[egg schedule-cache] loaded {n} entries from "
+                    f"{self._schedule_cache_file}",
+                    flush=True,
+                )
 
         # Kernel warmup.  Each unique (shape, start_pos) forward triggers
         # a fresh schedule pass the first time it's seen in a Python
@@ -794,6 +908,15 @@ class TinygradBackend(StepBackend):
                     model.max_context,
                     self._used_chunk_positions,
                 )
+            # And, under the experimental flag, snapshot the actual
+            # tinygrad schedule_cache to disk so next startup can skip
+            # the schedule pass entirely.  The file can get sizeable
+            # (~MB for a full transformer's worth of schedules) so
+            # saving after each request is a tradeoff; could be
+            # debounced in the future but disk write of a few MB is
+            # trivial next to the 12s-per-position we're avoiding.
+            if self._schedule_cache_enabled:
+                _save_schedule_cache_from_tinygrad(self._schedule_cache_file)
 
     def model_name(self) -> str:
         return self._model_name_str
