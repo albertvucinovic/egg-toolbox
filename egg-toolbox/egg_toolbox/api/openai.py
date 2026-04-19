@@ -308,12 +308,22 @@ def _parse_messages(raw: list[dict]) -> list[ChatMessage]:
                 for tc in m["tool_calls"]
             )
 
+        # Accept ``reasoning_content`` on assistant history messages so
+        # the model's prior chain-of-thought round-trips.  This matches
+        # the convention used by DeepSeek, Qwen, and vLLM.  We accept
+        # ``reasoning`` as an alternative spelling for lenience.  Only
+        # meaningful on ``role=assistant``; silently ignored elsewhere.
+        reasoning = None
+        if m.get("role") == "assistant":
+            reasoning = m.get("reasoning_content") or m.get("reasoning")
+
         messages.append(ChatMessage(
             role=m["role"],
             content=content,
             name=m.get("name"),
             tool_calls=tool_calls,
             tool_call_id=m.get("tool_call_id"),
+            reasoning=reasoning,
         ))
     return messages
 

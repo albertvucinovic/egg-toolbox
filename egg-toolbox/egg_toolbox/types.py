@@ -104,6 +104,18 @@ class ChatMessage:
     name: str | None = None                     # tool name (for role=tool)
     tool_calls: tuple[ToolCall, ...] | None = None
     tool_call_id: str | None = None             # for role=tool
+    # Prior chain-of-thought emitted by the model during a previous turn
+    # and sent back by the client for replay.  When the chat template
+    # supports a ``message.reasoning_content`` key (Qwen3, DeepSeek) we
+    # pass this straight through so the rendered history bytes match
+    # what the model originally generated -- that's what keeps the KV
+    # prefix cache hitting AND gives the model its own CoT back.
+    #
+    # Wire format: OpenAI API uses ``message.reasoning_content``
+    # (matches DeepSeek, Qwen, vLLM conventions).  Anthropic API uses
+    # a content block with ``type=thinking`` (native schema).  Both
+    # project to this single field on ``ChatMessage``.
+    reasoning: str | None = None
 
 
 # --- Semantic Events (internal, backend-independent) ---

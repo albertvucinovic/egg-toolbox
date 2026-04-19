@@ -22,10 +22,26 @@ fires *before* ``TOOL_CALL_NAME`` arrives, we defer emitting the
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
 from typing import Any
+
+
+# Synthesised ``signature`` we attach to ``thinking`` content blocks so
+# Anthropic-SDK clients don't reject the output.  Real Anthropic
+# signatures are cryptographic authenticity tags over the thinking
+# payload; since this is a local runtime we produce a deterministic
+# hash instead.  Clients that simply round-trip the field (the common
+# case) are unaffected; clients that actively verify would reject, and
+# that's acceptable -- they wouldn't trust an unknown issuer anyway.
+_SIGNATURE_PREFIX = "egg-toolbox:"
+
+
+def _synth_signature(thinking_text: str) -> str:
+    digest = hashlib.sha256(thinking_text.encode("utf-8")).hexdigest()
+    return f"{_SIGNATURE_PREFIX}{digest[:32]}"
 
 from starlette.responses import JSONResponse, StreamingResponse
 
@@ -148,6 +164,12 @@ class _BlockProjector:
         # as content_block_start at NAME time (so name is known).
         self._tool_block_index: dict[int, int] = {}
         self._tool_started: set[int] = set()   # have we emitted content_block_start?
+        # Accumulated thinking text for the currently-open thinking
+        # block.  On close we synthesise a signature over this text and
+        # emit a ``signature_delta`` before ``content_block_stop`` --
+        # matches Anthropic's native streaming shape, so SDK clients
+        # that round-trip the signature do so cleanly.
+        self._thinking_buffer: list[str] = []
 
     def feed(self, event: SemanticEvent) -> list[tuple[str, dict]]:
         out: list[tuple[str, dict]] = []
@@ -177,11 +199,13 @@ class _BlockProjector:
                 out.extend(self._close_current())
                 self._block_index += 1
                 self._current = "thinking"
+                self._thinking_buffer = []
                 out.append(("content_block_start", {
                     "type": "content_block_start",
                     "index": self._block_index,
                     "content_block": {"type": "thinking", "thinking": ""},
                 }))
+            self._thinking_buffer.append(event.text)
             out.append(("content_block_delta", {
                 "type": "content_block_delta",
                 "index": self._block_index,
@@ -245,7 +269,29 @@ class _BlockProjector:
         return self._close_current()
 
     def _close_current(self) -> list[tuple[str, dict]]:
-        if self._current in ("text", "thinking"):
+        if self._current == "thinking":
+            # Emit signature_delta right before stop, mirroring
+            # Anthropic's native extended-thinking stream shape.  The
+            # signature is synthesised from the accumulated text so
+            # clients that validate it see a stable tag over the same
+            # thinking body they received.
+            thinking_text = "".join(self._thinking_buffer)
+            self._thinking_buffer = []
+            sig_event = ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": self._block_index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": _synth_signature(thinking_text),
+                },
+            })
+            stop_event = ("content_block_stop", {
+                "type": "content_block_stop",
+                "index": self._block_index,
+            })
+            self._current = None
+            return [sig_event, stop_event]
+        if self._current == "text":
             event = ("content_block_stop", {
                 "type": "content_block_stop",
                 "index": self._block_index,
@@ -299,7 +345,12 @@ async def _non_stream_response(
 
     content: list[dict] = []
     if reasoning_parts:
-        content.append({"type": "thinking", "thinking": "".join(reasoning_parts)})
+        thinking_text = "".join(reasoning_parts)
+        content.append({
+            "type": "thinking",
+            "thinking": thinking_text,
+            "signature": _synth_signature(thinking_text),
+        })
     if text_parts:
         content.append({"type": "text", "text": "".join(text_parts)})
     content.extend(tool_calls)
@@ -360,8 +411,9 @@ def _parse_messages(raw: list[dict], system: Any) -> list[ChatMessage]:
             out.append(ChatMessage(role=role, content=""))
             continue
 
-        # Array content: split into text / tool_use / tool_result parts.
+        # Array content: split into text / thinking / tool_use / tool_result parts.
         text_pieces: list[str] = []
+        thinking_pieces: list[str] = []
         tool_calls_out: list[ToolCall] = []
         tool_results: list[tuple[str, str]] = []  # (tool_use_id, result_text)
         image_parts: list[ContentPart] = []
@@ -372,6 +424,24 @@ def _parse_messages(raw: list[dict], system: Any) -> list[ChatMessage]:
             btype = block.get("type")
             if btype == "text":
                 text_pieces.append(block.get("text", ""))
+            elif btype == "thinking":
+                # Assistant's prior chain-of-thought, echoed back for
+                # replay.  ``signature`` is Anthropic's authenticity
+                # tag; we accept it for wire compatibility but don't
+                # verify since this is a local runtime.  Concatenate
+                # if multiple thinking blocks appear (Anthropic allows
+                # redacted_thinking blocks interspersed; we treat them
+                # the same -- raw text round-trip).
+                thinking_pieces.append(block.get("thinking", ""))
+            elif btype == "redacted_thinking":
+                # Anthropic's opaque "encrypted thinking" -- we don't
+                # have keys to decrypt.  Preserve the placeholder so
+                # the client's round-trip remains faithful; the
+                # template ignores it.  (If a future local runtime
+                # wanted to replay a hosted-Anthropic conversation,
+                # it would need to skip these blocks; today we just
+                # preserve their text payload if any.)
+                thinking_pieces.append(block.get("data", ""))
             elif btype == "image":
                 src = block.get("source") or {}
                 image_parts.append(ContentPart(
@@ -430,10 +500,20 @@ def _parse_messages(raw: list[dict], system: Any) -> list[ChatMessage]:
         else:
             final_content = ""
 
+        # Thinking content only makes sense on assistant history
+        # messages; for other roles we just drop it (Anthropic's API
+        # wouldn't accept it there either).
+        reasoning_str = (
+            "".join(thinking_pieces)
+            if thinking_pieces and role == "assistant"
+            else None
+        )
+
         out.append(ChatMessage(
             role=role,
             content=final_content,
             tool_calls=tuple(tool_calls_out) if tool_calls_out else None,
+            reasoning=reasoning_str,
         ))
 
     return out

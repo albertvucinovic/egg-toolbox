@@ -190,6 +190,17 @@ class ChatTemplate:
             d["tool_call_id"] = msg.tool_call_id
         if msg.name is not None:
             d["name"] = msg.name
+        # Expose prior chain-of-thought to the Jinja template so history
+        # messages render with their original ``<think>...</think>``
+        # (or equivalent) bytes.  Qwen3's template reads
+        # ``message.reasoning_content``; DeepSeek uses the same key.
+        # Passing it through makes the tokenised history match what the
+        # model originally generated -- that's what restores prefix-
+        # cache hits across turns, and also gives the model its own
+        # prior CoT back for coherence.  Templates that don't reference
+        # ``reasoning_content`` simply ignore the extra key.
+        if msg.reasoning:
+            d["reasoning_content"] = msg.reasoning
         return d
 
     @staticmethod
