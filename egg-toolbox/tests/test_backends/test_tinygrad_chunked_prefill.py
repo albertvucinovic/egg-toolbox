@@ -338,9 +338,9 @@ class TestPersistedWarmupPositions:
         fake.calls.clear()
 
         backend._warmup(mode="persisted", chunk_size=128)
-        # Expected warmup calls: three chunks at 0, 128, 256 + one T=1.
+        # Int-start_pos path: three chunks at 0, 128, 256 + 2x T=1 decode.
         assert fake.calls == [
-            (128, 0), (128, 128), (128, 256), (1, 1),
+            (128, 0), (128, 128), (128, 256), (1, 1), (1, 1),
         ], fake.calls
 
     def test_persisted_mode_falls_back_to_first_when_file_missing(
@@ -353,8 +353,8 @@ class TestPersistedWarmupPositions:
         fake.calls.clear()
 
         backend._warmup(mode="persisted", chunk_size=128)
-        # Fallback = "first" mode: one chunk @ 0 + one T=1.
-        assert fake.calls == [(128, 0), (1, 1)], fake.calls
+        # Fallback = "first" mode: one chunk @ 0 + 2x T=1.
+        assert fake.calls == [(128, 0), (1, 1), (1, 1)], fake.calls
         captured = capsys.readouterr()
         assert "no persisted positions" in captured.out
 
@@ -378,7 +378,7 @@ class TestPersistedWarmupPositions:
         fake.calls.clear()
 
         backend._warmup(mode="persisted", chunk_size=128)
-        assert fake.calls == [(128, 0), (1, 1)], fake.calls
+        assert fake.calls == [(128, 0), (1, 1), (1, 1)], fake.calls
 
     def test_malformed_positions_file_does_not_crash(
         self, monkeypatch, tmp_path,
@@ -393,7 +393,7 @@ class TestPersistedWarmupPositions:
 
         # Should fall back to "first" without raising.
         backend._warmup(mode="persisted", chunk_size=128)
-        assert fake.calls == [(128, 0), (1, 1)], fake.calls
+        assert fake.calls == [(128, 0), (1, 1), (1, 1)], fake.calls
 
 
 class TestWarmup:
@@ -417,8 +417,11 @@ class TestWarmup:
         backend = _make_loaded_backend(monkeypatch, fake)
         fake.calls.clear()
         backend._warmup(mode="first", chunk_size=128)
-        # One chunk @ 0, one T=1 decode @ 1 (UOp bound to 1).
-        assert fake.calls == [(128, 0), (1, 1)], fake.calls
+        # Int-start_pos path (EGG_JIT_CHUNKS=0): one chunk @ 0.
+        # T=1 decode fires TWICE so tinygrad's TinyJit.cnt advances
+        # to 2 (captured); first real decode then replays immediately
+        # instead of incurring the ~60s capture cost.
+        assert fake.calls == [(128, 0), (1, 1), (1, 1)], fake.calls
 
     def test_full_fires_one_chunk_per_aligned_position(self, monkeypatch):
         fake = _FakeModel(script=[0], max_context=512)
@@ -426,9 +429,9 @@ class TestWarmup:
         fake.calls.clear()
         backend._warmup(mode="full", chunk_size=128)
         # positions = range(0, 512 - 128, 128) = [0, 128, 256] (three chunks)
-        # plus one T=1 decode.
+        # plus two T=1 decode calls (to bump TinyJit cnt to 2).
         assert fake.calls == [
-            (128, 0), (128, 128), (128, 256), (1, 1),
+            (128, 0), (128, 128), (128, 256), (1, 1), (1, 1),
         ], fake.calls
 
     def test_full_custom_chunk_size(self, monkeypatch):
@@ -437,9 +440,9 @@ class TestWarmup:
         fake.calls.clear()
         backend._warmup(mode="full", chunk_size=64)
         # positions = range(0, 300-64, 64) = [0, 64, 128, 192] (four chunks)
-        # plus one T=1 decode.
+        # plus two T=1 decode calls.
         assert fake.calls == [
-            (64, 0), (64, 64), (64, 128), (64, 192), (1, 1),
+            (64, 0), (64, 64), (64, 128), (64, 192), (1, 1), (1, 1),
         ], fake.calls
 
     def test_unknown_mode_is_noop(self, monkeypatch, capsys):

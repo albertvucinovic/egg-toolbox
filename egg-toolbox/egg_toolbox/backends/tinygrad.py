@@ -444,22 +444,30 @@ class TinygradBackend(StepBackend):
 
         # Chunk kernels.
         if jit_chunks:
-            # One symbolic warmup covers all positions under JIT.
-            t = Tensor([dummy_chunk], dtype="int32")
-            t0 = _time.monotonic()
-            try:
-                _ = self._model(t, v_sp_warmup.bind(1))
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"[egg warmup] symbolic chunk FAILED: "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-            else:
+            # tinygrad's TinyJit needs THREE calls to transition into
+            # replay mode (engine/jit.py): cnt=0 runs eager, cnt=1
+            # captures the graph, cnt>=2 replays.  A single warmup
+            # call only bumps cnt to 1, so the FIRST real user
+            # request would be the slow capture call (~60s) and only
+            # the SECOND would replay.  Fire twice here so cnt=2 by
+            # the time real traffic arrives -- first real forward
+            # replays immediately.
+            for call_num in (1, 2):
+                t = Tensor([dummy_chunk], dtype="int32")
+                t0 = _time.monotonic()
+                try:
+                    _ = self._model(t, v_sp_warmup.bind(1))
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"[egg warmup] symbolic chunk call #{call_num} "
+                        f"FAILED: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    break
                 elapsed = _time.monotonic() - t0
                 print(
                     f"[egg warmup]   symbolic chunk T={chunk_size} "
-                    f"(UOp start_pos)  {elapsed:6.2f}s",
+                    f"(UOp start_pos) call #{call_num}  {elapsed:6.2f}s",
                     flush=True,
                 )
         else:
@@ -483,22 +491,27 @@ class TinygradBackend(StepBackend):
                     flush=True,
                 )
 
-        # T=1 decode kernel (UOp-bound start_pos).  Only needs one
-        # warmup because the same kernel serves every decode step.
+        # T=1 decode kernel (UOp-bound start_pos).  Fire TWICE so
+        # TinyJit's cnt bumps to 2 (captured) and real decode forwards
+        # replay instead of paying the capture cost at the user's
+        # first token request.  See the chunk warmup above for why.
         v_sp = UOp.variable("start_pos", 0, max_ctx - 1)
-        t = Tensor([[dummy_decode]], dtype="int32")
-        t0 = _time.monotonic()
-        try:
-            _ = self._model(t, v_sp.bind(1))
+        for call_num in (1, 2):
+            t = Tensor([[dummy_decode]], dtype="int32")
+            t0 = _time.monotonic()
+            try:
+                _ = self._model(t, v_sp.bind(1))
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[egg warmup] T=1 decode call #{call_num} FAILED: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                break
             elapsed = _time.monotonic() - t0
             print(
-                f"[egg warmup]   T=1 decode @ 1  {elapsed:6.2f}s",
-                flush=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[egg warmup] T=1 decode FAILED: "
-                f"{type(exc).__name__}: {exc}",
+                f"[egg warmup]   T=1 decode @ 1 call #{call_num}  "
+                f"{elapsed:6.2f}s",
                 flush=True,
             )
 
