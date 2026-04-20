@@ -205,6 +205,22 @@ export EGG_SCHEDULE_CACHE="${EGG_SCHEDULE_CACHE:-1}"
 # After those two runs, steady-state chunks should be ~400ms.
 export EGG_JIT_CHUNKS="${EGG_JIT_CHUNKS:-0}"
 
+# Block-tiled FlashAttention opt-in (workspace-2r9).  When enabled,
+# each TransformerBlock._attention is swapped for a per-block tiled
+# variant whose inner kernels are BEAM-tunable fixed-shape matmuls.
+# EGG_FLASH_BEAM: optional override for BEAM level on FA inner kernels
+# only (default: use JITBEAM global).  Set to 0 to skip BEAM on FA
+# kernels while keeping BEAM=2 on dequant/ffn matmuls.
+export EGG_FLASH_ATTENTION="${EGG_FLASH_ATTENTION:-0}"
+export EGG_FLASH_BLOCK_SIZE="${EGG_FLASH_BLOCK_SIZE:-256}"
+export EGG_FLASH_BEAM="${EGG_FLASH_BEAM:-}"
+
+# Tinygrad BEAM multiprocess pool workers.  Default for CUDA is
+# multiprocessing.cpu_count() which spawns ~32 workers and often
+# deadlocks on SQLite WAL contention (workspace-2gi).  PARALLEL=0
+# runs BEAM in-thread (safe with our search.py signal patch).
+export PARALLEL="${PARALLEL:-0}"
+
 # Force Python's stdout/stderr unbuffered so tinygrad's DEBUG lines
 # and our EGG_* prints flush immediately rather than accumulating in
 # a pipe buffer.  Without this, running under systemd-run --scope
@@ -232,6 +248,10 @@ exec systemd-run --scope --user -p CPUQuota=400% \
   --setenv="EGG_WARMUP=$EGG_WARMUP" \
   --setenv="EGG_SCHEDULE_CACHE=$EGG_SCHEDULE_CACHE" \
   --setenv="EGG_JIT_CHUNKS=$EGG_JIT_CHUNKS" \
+  --setenv="EGG_FLASH_ATTENTION=$EGG_FLASH_ATTENTION" \
+  --setenv="EGG_FLASH_BLOCK_SIZE=$EGG_FLASH_BLOCK_SIZE" \
+  --setenv="EGG_FLASH_BEAM=$EGG_FLASH_BEAM" \
+  --setenv="PARALLEL=$PARALLEL" \
   --setenv="PYTHONUNBUFFERED=$PYTHONUNBUFFERED" \
   "$SCRIPT_DIR/.venv/bin/python" -u -m egg_toolbox "$SCRIPT_DIR/models/Qwen_Qwen3-8B-Q4_0.gguf" \
   --backend tinygrad \
