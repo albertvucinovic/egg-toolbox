@@ -377,8 +377,19 @@ def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner",
         block-fixed kernels, JIT reuses across all positions, so we don't
         need UOp start_pos for kernel-cache reuse anyway.
         """
-        from tinygrad import Tensor
+        from tinygrad import Tensor, UOp
         from tinygrad.apps.llm import apply_rope, precompute_freqs_cis
+
+        # Defensive: if caller passed a bound UOp, unwrap to int.
+        # The LlamaArchitecture gate usually handles this upstream, but
+        # direct monkey-patch users may hand us a UOp.
+        if isinstance(start_pos, UOp):
+            if getattr(start_pos, "src", None) and len(start_pos.src) >= 2 and start_pos.src[1].arg is not None:
+                start_pos = int(start_pos.src[1].arg)
+            else:
+                raise TypeError(
+                    f"flash attention requires int start_pos, got unbound UOp: {start_pos}"
+                )
 
         x_norm = self.attn_norm(x)
         q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)

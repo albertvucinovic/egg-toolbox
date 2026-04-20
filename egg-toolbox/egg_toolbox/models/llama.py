@@ -26,6 +26,25 @@ if TYPE_CHECKING:
     from tinygrad import Tensor, UOp
 
 
+def _unbind_uop_to_int(sp: "UOp") -> int:
+    """Extract the bound int value from a ``UOp.variable(...).bind(n)``.
+
+    Flash-attention's Python-side block loop needs an int ``start_pos``.
+    The backend sometimes passes a bound symbolic UOp (for the T=1
+    decode JIT codepath); we unpack it here.
+
+    Tinygrad shape: ``UOp(Ops.BIND, src=(DEFINE_VAR(...), CONST(n)))``.
+    """
+    # Ops.BIND source tuple is (DEFINE_VAR, CONST); the CONST's arg is
+    # the bound value.
+    if getattr(sp, "src", None) and len(sp.src) >= 2 and sp.src[1].arg is not None:
+        return int(sp.src[1].arg)
+    # Fallback: some UOps expose the int value via ``.arg`` directly.
+    if getattr(sp, "arg", None) is not None and isinstance(sp.arg, int):
+        return int(sp.arg)
+    raise TypeError(f"cannot unbind UOp to int: {sp}")
+
+
 @register("llama", "qwen2", "qwen3", fallback=True)
 class LlamaArchitecture(Architecture):
     """Thin shell around ``tinygrad.apps.llm.Transformer`` that:
@@ -141,6 +160,16 @@ class LlamaArchitecture(Architecture):
         debug = _os.environ.get("EGG_DEBUG_JIT", "0") != "0"
         path = "eager"
         try:
+            # With flash attention on, the block-tiled path needs an
+            # int ``start_pos`` (its Python loop count depends on it),
+            # and it already provides per-block JIT reuse internally --
+            # we get kernel-cache hits across positions without the
+            # outer UOp-JIT.  Unbind if the caller passed a UOp.
+            if self._flash_attention:
+                if isinstance(start_pos, UOp):
+                    start_pos = _unbind_uop_to_int(start_pos)
+                path = f"flash-eager-T{tokens.shape[1]}"
+                return self._forward_logits(tokens, start_pos)
             if getenv("JIT", 1) and isinstance(start_pos, UOp):
                 if tokens.shape[1] == 1:
                     path = "jit-decode"
