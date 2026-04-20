@@ -303,9 +303,26 @@ class FlashAttentionRunner:
         if self._beam_override is None:
             jit_fn(*args)
             return
-        from tinygrad.helpers import Context
-        with Context(BEAM=self._beam_override):
+        # TinyJit wraps each capture in ``Context(BEAM=getenv("JITBEAM",
+        # BEAM.value))`` (tinygrad/engine/jit.py:300), which blows away
+        # any outer ``Context(BEAM=...)`` we set.  And ``getenv`` is
+        # ``@functools.cache``d, so just mutating os.environ doesn't
+        # take effect either.  So: mutate env, invalidate the cache,
+        # then restore.
+        import os as _os
+        from tinygrad.helpers import getenv
+
+        old_jitbeam = _os.environ.get("JITBEAM")
+        _os.environ["JITBEAM"] = str(self._beam_override)
+        getenv.cache_clear()
+        try:
             jit_fn(*args)
+        finally:
+            if old_jitbeam is None:
+                _os.environ.pop("JITBEAM", None)
+            else:
+                _os.environ["JITBEAM"] = old_jitbeam
+            getenv.cache_clear()
 
     def full(self, q, k_block, v_block, m_io, l_io, out_io):
         """Apply one fully-attended block update, mutating ``m_io``,
