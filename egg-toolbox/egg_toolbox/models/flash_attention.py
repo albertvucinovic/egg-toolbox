@@ -52,6 +52,12 @@ def _block_update_full(
         out_prev  : (B, H, T, d)
 
     Returns updated ``(m, l, out)`` with the same shapes.
+
+    ``.contiguous()`` barriers split the accumulator updates into
+    distinct kernels -- the fused ``(out_prev * alpha) + matmul``
+    kernel signature reproducibly hangs tinygrad's BEAM search on the
+    specific action it picks, so we avoid generating it.  Splitting
+    costs ~1 extra kernel launch per block but unblocks BEAM tuning.
     """
     s = q.matmul(k_block.transpose(-2, -1)) * inv_sqrt_d             # (B, H, T, block_len)
     m_block = s.max(axis=-1, keepdim=True)                            # (B, H, T, 1)
@@ -59,7 +65,12 @@ def _block_update_full(
     alpha = (m_prev - m_new).exp()                                    # (B, H, T, 1)
     p_tilde = (s - m_new).exp()                                       # (B, H, T, block_len)
     l_new = l_prev * alpha + p_tilde.sum(axis=-1, keepdim=True)
-    out_new = out_prev * alpha + p_tilde.matmul(v_block)
+
+    # Split fused mul+matmul+add so tinygrad can't produce the BEAM-
+    # hanging kernel pattern.  ``.contiguous()`` forces a realize barrier.
+    scaled_prev = (out_prev * alpha).contiguous()
+    new_contrib = p_tilde.matmul(v_block)
+    out_new = scaled_prev + new_contrib
     return m_new, l_new, out_new
 
 
@@ -85,7 +96,10 @@ def _block_update_masked(
     alpha = (m_prev - m_new).exp()
     p_tilde = (s - m_new).exp()
     l_new = l_prev * alpha + p_tilde.sum(axis=-1, keepdim=True)
-    out_new = out_prev * alpha + p_tilde.matmul(v_block)
+
+    scaled_prev = (out_prev * alpha).contiguous()
+    new_contrib = p_tilde.matmul(v_block)
+    out_new = scaled_prev + new_contrib
     return m_new, l_new, out_new
 
 
@@ -327,21 +341,23 @@ class FlashAttentionRunner:
     def full(self, q, k_block, v_block, m_io, l_io, out_io):
         """Apply one fully-attended block update, mutating ``m_io``,
         ``l_io``, ``out_io`` in place."""
-        # TinyJit rejects CONST-UOp inputs; contiguous() materializes
-        # slices/constants into real buffers.
-        q = q.contiguous()
-        k_block = k_block.contiguous()
-        v_block = v_block.contiguous()
+        # ``.contiguous().realize()`` forces each input into a fresh
+        # standalone buffer (no slice/padded-view metadata).  tinygrad
+        # BEAM search otherwise mishandles padded tensors from slices
+        # of a larger backing (per upstream dev guidance).
+        q = q.contiguous().realize()
+        k_block = k_block.contiguous().realize()
+        v_block = v_block.contiguous().realize()
         key = (q.shape, k_block.shape, m_io.shape, l_io.shape, out_io.shape)
         self._run(self._full_jit_for(key), q, k_block, v_block, m_io, l_io, out_io)
 
     def masked(self, q, k_block, v_block, mask, m_io, l_io, out_io):
         """Apply one boundary-block update (with mask), mutating
         ``m_io``, ``l_io``, ``out_io`` in place."""
-        q = q.contiguous()
-        k_block = k_block.contiguous()
-        v_block = v_block.contiguous()
-        mask = mask.contiguous()
+        q = q.contiguous().realize()
+        k_block = k_block.contiguous().realize()
+        v_block = v_block.contiguous().realize()
+        mask = mask.contiguous().realize()
         key = (q.shape, k_block.shape, mask.shape, m_io.shape, l_io.shape, out_io.shape)
         self._run(self._masked_jit_for(key), q, k_block, v_block, mask, m_io, l_io, out_io)
 
@@ -421,16 +437,26 @@ def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner",
         # start_pos is an int here, so N is a Python int and the block
         # loop has a concrete count.
         N = int(start_pos) + T
-        k_full = self.cache_kv[0, :, :, 0:N, :]
-        v_full = self.cache_kv[1, :, :, 0:N, :]
+
+        # Materialize K/V into fresh buffers AT THE N SIZE.  tinygrad
+        # dev notes that BEAM search mishandles ``padded'' tensor
+        # views: when we slice ``cache_kv[:, :, :, 0:N, :]`` over the
+        # max_context-sized backing, the scheduler retains the
+        # "tensor of max_context, valid prefix N" metadata and BEAM
+        # searches over it badly (produces infinite-compile kernels
+        # or 5-10x suboptimal GEMMs).  ``.contiguous().realize()``
+        # forces a copy into a fresh buffer with no padding metadata
+        # so BEAM sees a clean fixed-shape tensor.
+        k_full = self.cache_kv[0, :, :, 0:N, :].contiguous().realize()
+        v_full = self.cache_kv[1, :, :, 0:N, :].contiguous().realize()
 
         # GQA: expand k/v once to n_heads.  M5 will replace this with
         # in-kernel broadcast; for now, simple repeat_interleave matches
         # tinygrad upstream's enable_gqa=True behaviour.
         if self.n_heads != self.n_kv_heads:
             repeat = self.n_heads // self.n_kv_heads
-            k_full = k_full.repeat_interleave(repeat, dim=1)
-            v_full = v_full.repeat_interleave(repeat, dim=1)
+            k_full = k_full.repeat_interleave(repeat, dim=1).contiguous().realize()
+            v_full = v_full.repeat_interleave(repeat, dim=1).contiguous().realize()
 
         attn = tiled_attention(
             q, k_full, v_full,
