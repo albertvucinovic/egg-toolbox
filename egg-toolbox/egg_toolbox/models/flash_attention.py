@@ -236,10 +236,18 @@ class FlashAttentionRunner:
     capture, third+ are replay.
     """
 
-    def __init__(self, inv_sqrt_d: float):
+    def __init__(self, inv_sqrt_d: float, beam_override: int | None = None):
+        """``beam_override``: if set, wrap each JIT call in
+        ``Context(BEAM=beam_override)`` so flash-attention inner kernels
+        use a different BEAM level than the global ``JITBEAM``.  Useful
+        when BEAM on one specific kernel hangs (see bd memory
+        ``flash-attention-beam-action-58-hang-2026-04-20``): set to 0 to
+        skip BEAM on FA kernels while keeping BEAM=2 on the rest of the
+        model."""
         self._inv_sqrt_d = float(inv_sqrt_d)
         self._full_jits: dict = {}
         self._masked_jits: dict = {}
+        self._beam_override = beam_override
 
     def _full_jit_for(self, key):
         if key in self._full_jits:
@@ -291,6 +299,14 @@ class FlashAttentionRunner:
         self._masked_jits[key] = jit
         return jit
 
+    def _run(self, jit_fn, *args):
+        if self._beam_override is None:
+            jit_fn(*args)
+            return
+        from tinygrad.helpers import Context
+        with Context(BEAM=self._beam_override):
+            jit_fn(*args)
+
     def full(self, q, k_block, v_block, m_io, l_io, out_io):
         """Apply one fully-attended block update, mutating ``m_io``,
         ``l_io``, ``out_io`` in place."""
@@ -300,7 +316,7 @@ class FlashAttentionRunner:
         k_block = k_block.contiguous()
         v_block = v_block.contiguous()
         key = (q.shape, k_block.shape, m_io.shape, l_io.shape, out_io.shape)
-        self._full_jit_for(key)(q, k_block, v_block, m_io, l_io, out_io)
+        self._run(self._full_jit_for(key), q, k_block, v_block, m_io, l_io, out_io)
 
     def masked(self, q, k_block, v_block, mask, m_io, l_io, out_io):
         """Apply one boundary-block update (with mask), mutating
@@ -310,7 +326,7 @@ class FlashAttentionRunner:
         v_block = v_block.contiguous()
         mask = mask.contiguous()
         key = (q.shape, k_block.shape, mask.shape, m_io.shape, l_io.shape, out_io.shape)
-        self._masked_jit_for(key)(q, k_block, v_block, mask, m_io, l_io, out_io)
+        self._run(self._masked_jit_for(key), q, k_block, v_block, mask, m_io, l_io, out_io)
 
 
 # --------------------------------------------------------------------- #

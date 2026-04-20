@@ -79,10 +79,21 @@ class LlamaArchitecture(Architecture):
             head_dim = transformer.blk[0].head_dim
             inv_sqrt_d = 1.0 / _math.sqrt(head_dim)
 
+            # Optional BEAM override for just the FA inner kernels.
+            # Useful when JITBEAM=2 causes tinygrad to hang on a
+            # specific BEAM action for one of our flash kernels
+            # (observed 2026-04-20 on the out-update kernel).  Set
+            # EGG_FLASH_BEAM=0 to skip BEAM on FA kernels while
+            # keeping BEAM=2 on the rest of the model.
+            _beam_ov = _os.environ.get("EGG_FLASH_BEAM")
+            beam_override = int(_beam_ov) if _beam_ov is not None else None
+
             # One runner shared across all blocks: head_dim (and thus
             # inv_sqrt_d) is the same for every block in a Llama-family
             # model.  Each shape signature gets its own cached JIT.
-            self._flash_runner = FlashAttentionRunner(inv_sqrt_d=inv_sqrt_d)
+            self._flash_runner = FlashAttentionRunner(
+                inv_sqrt_d=inv_sqrt_d, beam_override=beam_override,
+            )
             for block in self.blk:
                 patch_block_with_flash_attention(
                     block, runner=self._flash_runner, B_block=B_block,
