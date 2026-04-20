@@ -859,14 +859,14 @@ class TinygradBackend(StepBackend):
         # position compiles its own kernel (~N_positions variants,
         # ~300 kernels for max_context=8196 at chunk=128).
         #
-        # EGG_JIT_CHUNKS=1 path: symbolic UOp start_pos.  We've
-        # patched each TransformerBlock's ``_attention`` (see
-        # egg_toolbox/models/symbolic_attention.py) to build the mask
-        # via arange+where instead of triu, which accepts symbolic
-        # dims.  One JIT trace then covers every chunk position;
-        # ~680 per-kernel Python dispatches per chunk collapse into
-        # one ``cuLaunchGraph``-scale submission (~8s -> ~400ms
-        # per chunk on Qwen3-8B at keep_packed).
+        # EGG_JIT_CHUNKS=1 path: symbolic UOp start_pos.  Requires
+        # the upstream ``Tensor._tri`` int-shape assertion removed
+        # (its body already supports symbolic ``r``/``c``).  With that
+        # removed, upstream ``_attention``'s
+        # ``Tensor.full(...).triu(start_pos+1)`` accepts the symbolic
+        # ``start_pos+T`` column dim, so one JIT trace covers every
+        # chunk position; ~680 per-kernel Python dispatches per chunk
+        # collapse into one ``cuLaunchGraph``-scale submission.
         jit_chunks = os.environ.get("EGG_JIT_CHUNKS", "0") != "0"
 
         def _forward_chunk(chunk_tokens: list[int], sp_int: int, label: str):

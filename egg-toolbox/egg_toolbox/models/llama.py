@@ -53,21 +53,40 @@ class LlamaArchitecture(Architecture):
         self.output = transformer.output
         self.max_context = transformer.max_context
 
-        # Opt-in: patch each block's ``_attention`` with a symbolic-
-        # friendly causal mask so T>1 forwards with UOp start_pos
-        # become JIT-eligible (tinygrad upstream gates T>1 on int
-        # start_pos because ``triu`` rejects symbolic shapes).  With
-        # EGG_JIT_CHUNKS=1, chunked-prefill submits every chunk via
-        # the JITted graph: ~680 per-kernel Python dispatches per
-        # chunk collapse into one graph submission, ~8s -> ~400ms.
-        # Off by default while we measure stability; see
-        # egg_toolbox/models/symbolic_attention.py for the risks.
+        # EGG_JIT_CHUNKS=1: route T>1 prefill chunks through TinyJit
+        # with a UOp start_pos, so every chunk position collapses into
+        # one captured graph and TinyJit replays it.  Requires the
+        # upstream ``Tensor._tri`` int-shape assertion removed.
+        #
+        # EGG_FLASH_ATTENTION=1: swap each block's ``_attention`` for
+        # a block-tiled FlashAttention variant that keeps all kernel
+        # shapes int.  Every per-block kernel reuses the same JIT
+        # across all positions, layers, and forwards.  This supersedes
+        # the symbolic-mask approach (which depended on BEAM being able
+        # to tune symbolic-axis kernels -- it can't).  See
+        # ``docs/flash-attention-design.md``.
         import os as _os
         self._jit_chunks = _os.environ.get("EGG_JIT_CHUNKS", "0") != "0"
-        if self._jit_chunks:
-            from .symbolic_attention import patch_block_attention
+        self._flash_attention = _os.environ.get("EGG_FLASH_ATTENTION", "0") != "0"
+
+        if self._flash_attention:
+            import math as _math
+            from .flash_attention import (
+                FlashAttentionRunner, patch_block_with_flash_attention,
+            )
+
+            B_block = int(_os.environ.get("EGG_FLASH_BLOCK_SIZE", "256"))
+            head_dim = transformer.blk[0].head_dim
+            inv_sqrt_d = 1.0 / _math.sqrt(head_dim)
+
+            # One runner shared across all blocks: head_dim (and thus
+            # inv_sqrt_d) is the same for every block in a Llama-family
+            # model.  Each shape signature gets its own cached JIT.
+            self._flash_runner = FlashAttentionRunner(inv_sqrt_d=inv_sqrt_d)
             for block in self.blk:
-                patch_block_attention(block, max_context=self.max_context)
+                patch_block_with_flash_attention(
+                    block, runner=self._flash_runner, B_block=B_block,
+                )
 
         # Build JITs once at construction time.  tinygrad's TinyJit
         # captures ONE trace per instance (shape mismatches raise
@@ -94,11 +113,12 @@ class LlamaArchitecture(Architecture):
         """JIT when start_pos is a UOp, eager otherwise.
 
         Upstream tinygrad additionally gates on ``tokens.shape[1] == 1``
-        because its ``_attention`` uses ``triu`` for the causal mask,
-        which rejects symbolic shape dims.  When ``EGG_JIT_CHUNKS=1``
-        we've patched each block's ``_attention`` to use an arange-
-        based mask instead, so T>1 with UOp start_pos also works --
-        one symbolic JIT trace covers every chunk position.
+        in its own ``__call__`` because its ``_attention`` used to
+        trip on ``triu``'s int-shape assertion.  With the upstream
+        ``Tensor._tri`` assertion removed (its body is already
+        symbolic-compatible), T>1 + UOp start_pos works natively, so
+        ``EGG_JIT_CHUNKS=1`` just adds the JIT routing that upstream's
+        gate would otherwise skip.
 
         Two JITs because TinyJit captures ONE trace per instance and
         raises ``JitError`` on shape mismatch: ``forward_jit`` for
