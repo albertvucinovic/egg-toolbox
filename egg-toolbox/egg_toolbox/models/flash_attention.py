@@ -401,7 +401,7 @@ def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner |
     if getattr(block, "_egg_flash_attention_patched", False):
         return
 
-    def _padded_attention(self: Any, x: "Tensor", start_pos: "int") -> "Tensor":
+    def _padded_attention(self: Any, x: "Tensor", start_pos) -> "Tensor":
         """Replacement for upstream ``TransformerBlock._attention``.
 
         Uses the full ``cache_kv[:, :, :, :, :]`` (max_context-wide)
@@ -409,20 +409,14 @@ def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner |
         Kernel shapes never vary with ``start_pos`` -- one BEAM search
         per signature serves every position.
 
-        Accepts int or bound-UOp ``start_pos``; UOp gets unwrapped to
-        int defensively (``start_pos`` is used in Python arithmetic for
-        the RoPE slice, which requires int).
+        Accepts int OR symbolic UOp ``start_pos``.  When the caller
+        passes a UOp, the mask's threshold (``start_pos + rows``) is
+        part of the graph as a symbolic value -- same graph topology
+        for every call, only the bound value varies.  tinygrad reuses
+        the compiled kernels across positions without recompile.
         """
-        from tinygrad import Tensor, UOp
+        from tinygrad import Tensor
         from tinygrad.apps.llm import apply_rope, precompute_freqs_cis
-
-        if isinstance(start_pos, UOp):
-            if getattr(start_pos, "src", None) and len(start_pos.src) >= 2 and start_pos.src[1].arg is not None:
-                start_pos = int(start_pos.src[1].arg)
-            else:
-                raise TypeError(
-                    f"padded attention requires int start_pos, got unbound UOp: {start_pos}"
-                )
 
         x_norm = self.attn_norm(x)
         q, k, v = self.attn_q(x_norm), self.attn_k(x_norm), self.attn_v(x_norm)
@@ -476,21 +470,25 @@ def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner |
     block._egg_flash_attention_patched = True
 
 
-def _build_padded_mask(T: int, start_pos: int, max_context: int, dtype: Any, device: Any) -> "Tensor":
+def _build_padded_mask(T: int, start_pos, max_context: int, dtype: Any, device: Any) -> "Tensor":
     """Build the (T, max_context) attention mask at fixed shape.
 
     Attend (mask = 0) iff ``col_abs <= start_pos + row``.  All other
-    positions get ``-inf`` so softmax assigns them zero weight.  The
-    shape is int-constant across every call; only the threshold
-    ``start_pos + row`` varies, which is data (not shape), so BEAM
-    compiles this path once per ``(T, max_context, dtype)`` signature.
+    positions get ``-inf`` so softmax assigns them zero weight.
+
+    ``start_pos`` may be a Python int or a tinygrad UOp (e.g. bound
+    symbolic variable).  When UOp, the threshold enters the graph as
+    a symbolic value; same graph topology across all calls -- only
+    the bound value varies.  Shape stays int-constant either way, so
+    BEAM compiles this path once per ``(T, max_context, dtype)``
+    signature.
     """
     from tinygrad import Tensor
     from tinygrad.dtype import dtypes
 
     rows = Tensor.arange(T, dtype=dtypes.int32, device=device).reshape(T, 1)
     cols = Tensor.arange(max_context, dtype=dtypes.int32, device=device).reshape(1, max_context)
-    allowed = cols <= (rows + int(start_pos))
+    allowed = cols <= (rows + start_pos)
     zero = Tensor.full((1,), 0.0, dtype=dtype, device=device)
     minus_inf = Tensor.full((1,), float("-inf"), dtype=dtype, device=device)
     return allowed.where(zero, minus_inf)

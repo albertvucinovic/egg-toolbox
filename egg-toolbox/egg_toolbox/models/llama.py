@@ -160,21 +160,17 @@ class LlamaArchitecture(Architecture):
         debug = _os.environ.get("EGG_DEBUG_JIT", "0") != "0"
         path = "eager"
         try:
-            # With flash attention on, the block-tiled path needs an
-            # int ``start_pos`` (its Python loop count depends on it),
-            # and it already provides per-block JIT reuse internally --
-            # we get kernel-cache hits across positions without the
-            # outer UOp-JIT.  Unbind if the caller passed a UOp.
-            if self._flash_attention:
-                if isinstance(start_pos, UOp):
-                    start_pos = _unbind_uop_to_int(start_pos)
-                path = f"flash-eager-T{tokens.shape[1]}"
-                return self._forward_logits(tokens, start_pos)
+            # With padded flash attention, kernel shapes are fixed
+            # independent of start_pos -- UOp start_pos flows through
+            # the whole graph unchanged, so tinygrad's forward_jit +
+            # forward_jit_chunk work identically to the triu path.
+            # Route T=1 decode to forward_jit, T>1 chunks to
+            # forward_jit_chunk (same as the non-flash path).
             if getenv("JIT", 1) and isinstance(start_pos, UOp):
                 if tokens.shape[1] == 1:
                     path = "jit-decode"
                     return self.forward_jit(tokens, start_pos)
-                elif self._jit_chunks:
+                elif self._flash_attention or self._jit_chunks:
                     path = f"jit-chunk-T{tokens.shape[1]}"
                     return self.forward_jit_chunk(tokens, start_pos)
             return self._forward_logits(tokens, start_pos)
