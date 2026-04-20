@@ -366,17 +366,33 @@ class FlashAttentionRunner:
 # Integration: monkey-patch tinygrad.apps.llm.TransformerBlock._attention
 # --------------------------------------------------------------------- #
 
-def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner", B_block: int = 256) -> None:
-    """Rebind ``block._attention`` to route through tiled FlashAttention.
+def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner | None" = None, B_block: int = 256) -> None:
+    """Rebind ``block._attention`` to route through padded-full-context
+    attention.
 
-    Upstream ``TransformerBlock._attention`` computes attention via
-    ``softmax(q @ k^T / sqrt(d) + triu_mask(start_pos+1)) @ v`` over
-    the full K/V cache -- the triu mask axis is symbolic, which defeats
-    BEAM kernel search.  This patched variant splits the attention into
-    fixed-size K/V blocks so each inner kernel is fully int-shape.
+    Compared to upstream (``q @ k[:N]^T + triu_mask(start_pos+1)`` which
+    varies the K/V axis with ``start_pos``), this variant keeps every
+    attention kernel's K/V axis fixed at ``max_context``.  The mask is
+    built from ``arange(max_context) <= start_pos + arange(T)`` so the
+    "future + beyond-valid-positions" contribution decays to zero in
+    softmax while the compute graph stays shape-stable.
 
-    ``runner`` holds the JITs that dispatch each block update.  One
-    runner per model is enough (all blocks share ``head_dim``).
+    Rationale: upstream tinygrad BEAM mis-searches tensors that are
+    sliced views over a larger backing (the padded-tensor bug the
+    tinygrad dev acknowledged).  Skipping the slice eliminates the
+    padded-view entirely -- ``cache_kv`` IS the buffer, used at full
+    shape.  Every forward produces the same kernel signatures, so BEAM
+    tunes once and every subsequent call is a cache hit.
+
+    Compute cost: at start_pos << max_context, we do extra work on
+    positions that contribute zero to the output.  This is amortised
+    because (a) GPU matmul throughput is high relative to Python
+    dispatch overhead, (b) block-tiled FA was ~5x worse due to
+    per-block dispatch cost, (c) once ``start_pos`` is reasonable
+    (say > max_context/4), waste is < 4x.
+
+    ``runner`` and ``B_block`` are kept for signature compatibility
+    with the earlier block-tiled implementation; both are unused.
 
     Idempotent: if already patched, no-op.
     """
@@ -385,26 +401,27 @@ def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner",
     if getattr(block, "_egg_flash_attention_patched", False):
         return
 
-    def _flash_attention(self: Any, x: "Tensor", start_pos: "int") -> "Tensor":
+    def _padded_attention(self: Any, x: "Tensor", start_pos: "int") -> "Tensor":
         """Replacement for upstream ``TransformerBlock._attention``.
 
-        Requires integer ``start_pos`` (not a UOp); tiled FlashAttention's
-        block-count depends on a concrete value at dispatch time.  With
-        block-fixed kernels, JIT reuses across all positions, so we don't
-        need UOp start_pos for kernel-cache reuse anyway.
+        Uses the full ``cache_kv[:, :, :, :, :]`` (max_context-wide)
+        every call and masks out positions beyond ``start_pos + T``.
+        Kernel shapes never vary with ``start_pos`` -- one BEAM search
+        per signature serves every position.
+
+        Accepts int or bound-UOp ``start_pos``; UOp gets unwrapped to
+        int defensively (``start_pos`` is used in Python arithmetic for
+        the RoPE slice, which requires int).
         """
         from tinygrad import Tensor, UOp
         from tinygrad.apps.llm import apply_rope, precompute_freqs_cis
 
-        # Defensive: if caller passed a bound UOp, unwrap to int.
-        # The LlamaArchitecture gate usually handles this upstream, but
-        # direct monkey-patch users may hand us a UOp.
         if isinstance(start_pos, UOp):
             if getattr(start_pos, "src", None) and len(start_pos.src) >= 2 and start_pos.src[1].arg is not None:
                 start_pos = int(start_pos.src[1].arg)
             else:
                 raise TypeError(
-                    f"flash attention requires int start_pos, got unbound UOp: {start_pos}"
+                    f"padded attention requires int start_pos, got unbound UOp: {start_pos}"
                 )
 
         x_norm = self.attn_norm(x)
@@ -434,40 +451,46 @@ def patch_block_with_flash_attention(block: Any, runner: "FlashAttentionRunner",
             Tensor.stack(k, v),
         ).realize()
 
-        # start_pos is an int here, so N is a Python int and the block
-        # loop has a concrete count.
-        N = int(start_pos) + T
+        # Use the FULL max_context cache_kv.  No slice, no padded view.
+        # Every forward sees K, V with shape (B, n_kv, max_context, d).
+        k_full = self.cache_kv[0]
+        v_full = self.cache_kv[1]
 
-        # Materialize K/V into fresh buffers AT THE N SIZE.  tinygrad
-        # dev notes that BEAM search mishandles ``padded'' tensor
-        # views: when we slice ``cache_kv[:, :, :, 0:N, :]`` over the
-        # max_context-sized backing, the scheduler retains the
-        # "tensor of max_context, valid prefix N" metadata and BEAM
-        # searches over it badly (produces infinite-compile kernels
-        # or 5-10x suboptimal GEMMs).  ``.contiguous().realize()``
-        # forces a copy into a fresh buffer with no padding metadata
-        # so BEAM sees a clean fixed-shape tensor.
-        k_full = self.cache_kv[0, :, :, 0:N, :].contiguous().realize()
-        v_full = self.cache_kv[1, :, :, 0:N, :].contiguous().realize()
+        # Build a causal + future-mask at fixed (T, max_context) shape.
+        # Attend iff ``col <= start_pos + row``: this hides future
+        # positions (j > start_pos + i) AND any cache_kv entries at
+        # indices >= start_pos + T (either zeros from init or stale).
+        mask = _build_padded_mask(
+            T=T, start_pos=start_pos, max_context=self.max_context,
+            dtype=x.dtype, device=x.device,
+        )
 
-        # GQA: expand k/v once to n_heads.  M5 will replace this with
-        # in-kernel broadcast; for now, simple repeat_interleave matches
-        # tinygrad upstream's enable_gqa=True behaviour.
-        if self.n_heads != self.n_kv_heads:
-            repeat = self.n_heads // self.n_kv_heads
-            k_full = k_full.repeat_interleave(repeat, dim=1).contiguous().realize()
-            v_full = v_full.repeat_interleave(repeat, dim=1).contiguous().realize()
-
-        attn = tiled_attention(
-            q, k_full, v_full,
-            start_pos=int(start_pos),
-            B_block=B_block,
-            causal=True,
-            runner=runner,
+        attn = q.scaled_dot_product_attention(
+            k_full, v_full, attn_mask=mask, enable_gqa=True,
         )
         attn = attn.transpose(1, 2).reshape(B, T, -1)
         attn = self.attn_output(attn)
         return x + attn
 
-    block._attention = _types.MethodType(_flash_attention, block)
+    block._attention = _types.MethodType(_padded_attention, block)
     block._egg_flash_attention_patched = True
+
+
+def _build_padded_mask(T: int, start_pos: int, max_context: int, dtype: Any, device: Any) -> "Tensor":
+    """Build the (T, max_context) attention mask at fixed shape.
+
+    Attend (mask = 0) iff ``col_abs <= start_pos + row``.  All other
+    positions get ``-inf`` so softmax assigns them zero weight.  The
+    shape is int-constant across every call; only the threshold
+    ``start_pos + row`` varies, which is data (not shape), so BEAM
+    compiles this path once per ``(T, max_context, dtype)`` signature.
+    """
+    from tinygrad import Tensor
+    from tinygrad.dtype import dtypes
+
+    rows = Tensor.arange(T, dtype=dtypes.int32, device=device).reshape(T, 1)
+    cols = Tensor.arange(max_context, dtype=dtypes.int32, device=device).reshape(1, max_context)
+    allowed = cols <= (rows + int(start_pos))
+    zero = Tensor.full((1,), 0.0, dtype=dtype, device=device)
+    minus_inf = Tensor.full((1,), float("-inf"), dtype=dtype, device=device)
+    return allowed.where(zero, minus_inf)
